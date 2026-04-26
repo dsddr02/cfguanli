@@ -347,7 +347,22 @@ async function handleAPI(req, env) {
     }
     return json({ success: true });
   }
-  
+  if (action === 'validate-credentials') {
+    const { email, key } = payload;
+    if (!email || !key) {
+      return json({ success: false, error: '缺少邮箱或 API Key' }, 400);
+    }
+    try {
+      const r = await cfAny('GET', '/accounts', email, key);
+      if (r.success && r.result && r.result.length > 0) {
+        return json({ success: true, message: '凭据有效', accountId: r.result[0].id });
+      } else {
+        return json({ success: false, error: r.errors?.[0]?.message || '凭据无效' });
+      }
+    } catch (e) {
+      return json({ success: false, error: e.message });
+    }
+  }
   // 需要 Cloudflare 凭据的操作
   const needsCreds = new Set([
     'list-accounts', 'list-workers', 'get-worker-script', 'deploy-worker',
