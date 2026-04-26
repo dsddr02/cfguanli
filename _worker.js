@@ -38,11 +38,17 @@ async function deriveKey(password, salt) {
   );
 }
 
-// 加密函数
+// 修复加密函数 - 使用 webcrypto 兼容方法
 async function encrypt(text, password) {
   const encoder = new TextEncoder();
-  const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
-  const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+  
+  // 使用 webcrypto 生成随机数
+  const salt = new Uint8Array(SALT_LENGTH);
+  const iv = new Uint8Array(IV_LENGTH);
+  
+  // 使用 crypto.getRandomValues（Workers 支持）
+  crypto.getRandomValues(salt);
+  crypto.getRandomValues(iv);
   
   const key = await deriveKey(password, salt);
   const encrypted = await crypto.subtle.encrypt(
@@ -51,18 +57,30 @@ async function encrypt(text, password) {
     encoder.encode(text)
   );
   
+  // 合并 salt + iv + encrypted
   const result = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
   result.set(salt, 0);
   result.set(iv, salt.length);
   result.set(new Uint8Array(encrypted), salt.length + iv.length);
   
-  return btoa(String.fromCharCode(...result));
+  // 转换为 base64
+  let binary = '';
+  for (let i = 0; i < result.length; i++) {
+    binary += String.fromCharCode(result[i]);
+  }
+  return btoa(binary);
 }
 
-// 解密函数
+// 修复解密函数
 async function decrypt(encryptedBase64, password) {
   const decoder = new TextDecoder();
-  const encrypted = Uint8Array.from(atob(encryptedBase64), c => c.charCodeAt(0));
+  
+  // 从 base64 恢复二进制数据
+  const binary = atob(encryptedBase64);
+  const encrypted = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    encrypted[i] = binary.charCodeAt(i);
+  }
   
   const salt = encrypted.slice(0, SALT_LENGTH);
   const iv = encrypted.slice(SALT_LENGTH, SALT_LENGTH + IV_LENGTH);
