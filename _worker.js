@@ -1119,7 +1119,7 @@ async function login() {
       localStorage.setItem('cf_session_token', result.sessionToken);
       
       // 设置 Cookie（重要！）
-      document.cookie = `session_token=${result.sessionToken}; path=/; max-age=28800; SameSite=Strict`;
+      document.cookie = 'session_token=' + result.sessionToken + '; path=/; max-age=28800; SameSite=Strict';
       
       console.log('Session saved to localStorage and Cookie');
       console.log('Cookie:', document.cookie);
