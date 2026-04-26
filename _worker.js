@@ -663,51 +663,121 @@ if (action === 'add-account') {
         return json({ success: false, error: 'Error' }); 
       }
       
-      case 'get-usage-today': { 
-        if (!payload.accountId) return json({ success: false }, 400); 
-        const { accountId, email, key: apikey } = payload; 
-        const now = new Date(); 
-        const end = now.toISOString(); 
-        now.setUTCHours(0, 0, 0, 0); 
-        const start = now.toISOString(); 
-        try { 
-          // 尝试通过每个脚本获取请求数
-          let totalRequests = 0;
-          const scriptsRes = await cfGet(`/accounts/${accountId}/workers/scripts`, email, apikey);
-          if (scriptsRes.success && scriptsRes.result) {
-            for (const script of scriptsRes.result) {
-              try {
-                const analyticsUrl = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${script.id}/analytics/summary?since=${start}&until=${end}`;
-                const analyticsRes = await fetch(analyticsUrl, {
-                  headers: { 'X-Auth-Email': email, 'X-Auth-Key': apikey }
-                });
-                if (analyticsRes.ok) {
-                  const data = await analyticsRes.json();
-                  if (data.result && data.result.requests) {
-                    totalRequests += data.result.requests;
-                  }
+      // 替换 get-usage-today 部分
+case 'get-usage-today': { 
+  if (!payload.accountId) return json({ success: false, error: 'accountId required' }, 400); 
+  const { accountId, email, key: apikey } = payload; 
+  
+  try {
+    const now = new Date();
+    const end = now.toISOString();
+    now.setUTCHours(0, 0, 0, 0);
+    const start = now.toISOString();
+    
+    let totalRequests = 0;
+    let hasData = false;
+    
+    // 方法1: 使用 GraphQL 查询（更准确）
+    try {
+      const graphqlQuery = {
+        query: `query {
+          viewer {
+            accounts(filter: {accountTag: "${accountId}"}) {
+              workersInvocationsAdaptive(
+                limit: 1,
+                filter: {
+                  datetime_geq: "${start}",
+                  datetime_lt: "${end}"
                 }
-              } catch (e) {}
+              ) {
+                sum {
+                  requests
+                }
+                dimensions {
+                  scriptName
+                }
+              }
             }
           }
-          
-          const percentage = Math.min(100, (totalRequests / 100000) * 100);
-          return json({ 
-            success: true, 
-            data: { 
-              total: totalRequests, 
-              workers: totalRequests, 
-              pages: 0, 
-              percentage: percentage 
-            } 
-          }); 
-        } catch(e){ 
-          return json({ 
-            success: true, 
-            data: { total: 0, workers: 0, pages: 0, percentage: 0 } 
-          }); 
-        } 
+        }`
+      };
+      
+      const graphqlRes = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Auth-Email": email,
+          "X-Auth-Key": apikey
+        },
+        body: JSON.stringify(graphqlQuery)
+      });
+      
+      if (graphqlRes.ok) {
+        const data = await graphqlRes.json();
+        const invocations = data?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive || [];
+        for (const inv of invocations) {
+          if (inv.sum?.requests) {
+            totalRequests += inv.sum.requests;
+            hasData = true;
+          }
+        }
       }
+    } catch (e) {
+      console.error('GraphQL error:', e);
+    }
+    
+    // 方法2: 如果 GraphQL 没有数据，尝试获取每个脚本的 analytics（最近7天）
+    if (!hasData) {
+      try {
+        const scriptsRes = await cfGet(`/accounts/${accountId}/workers/scripts`, email, apikey);
+        if (scriptsRes.success && scriptsRes.result) {
+          // 获取最近7天的数据
+          const sevenDaysAgo = new Date();
+          sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+          const since = sevenDaysAgo.toISOString();
+          
+          for (const script of scriptsRes.result) {
+            try {
+              const analyticsUrl = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${script.id}/analytics/summary?since=${since}`;
+              const analyticsRes = await fetch(analyticsUrl, {
+                headers: { 'X-Auth-Email': email, 'X-Auth-Key': apikey }
+              });
+              if (analyticsRes.ok) {
+                const data = await analyticsRes.json();
+                if (data.result && data.result.requests) {
+                  totalRequests += data.result.requests;
+                  hasData = true;
+                }
+              }
+            } catch (e) {}
+          }
+        }
+      } catch (e) {
+        console.error('Analytics error:', e);
+      }
+    }
+    
+    const percentage = Math.min(100, (totalRequests / 100000) * 100);
+    
+    return json({ 
+      success: true, 
+      data: { 
+        total: totalRequests, 
+        workers: totalRequests, 
+        pages: 0, 
+        percentage: percentage,
+        hasData: hasData,
+        start: start,
+        end: end
+      } 
+    }); 
+  } catch(e) { 
+    return json({ 
+      success: true, 
+      data: { total: 0, workers: 0, pages: 0, percentage: 0, error: e.message } 
+    }); 
+  } 
+}
       
       case 'list-kv-namespaces': 
         return json(await cfGet(`/accounts/${payload.accountId}/storage/kv/namespaces`, payload.email, payload.key));
