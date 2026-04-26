@@ -131,23 +131,46 @@ async function handleRequest(request, env) {
     });
   }
   
-  // Worker 管理页面
+// Worker 管理页面（需要认证）
   if (request.method === 'GET' && p.startsWith('/workers')) {
-    const sessionToken = request.headers.get('X-Session-Token') || url.searchParams.get('session');
-    
-    if (sessionToken) {
-      const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
-      if (session && session.expires > Date.now()) {
-        return new Response(renderAppHTML(), { 
-          headers: { 'content-type': 'text/html; charset=utf-8' } 
-        });
-      }
+  // 从 Cookie 或 Header 或 URL 参数获取 session token
+  let sessionToken = request.headers.get('X-Session-Token');
+  
+  // 如果没有 Header，尝试从 Cookie 获取
+  if (!sessionToken) {
+    const cookie = request.headers.get('Cookie');
+    if (cookie) {
+      const match = cookie.match(/session_token=([^;]+)/);
+      if (match) sessionToken = match[1];
     }
-    
-    return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(p)}`, 302);
   }
-
-  return new Response('Not Found', { status: 404 });
+  
+  // 如果还没有，尝试从 URL 参数获取
+  if (!sessionToken) {
+    sessionToken = url.searchParams.get('session');
+  }
+  
+  console.log('Session token from request:', sessionToken);
+  
+  if (sessionToken) {
+    const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
+    console.log('Session found:', !!session);
+    
+    if (session && session.expires > Date.now()) {
+      // 认证成功，渲染页面
+      return new Response(renderAppHTML(), { 
+        headers: { 
+          'content-type': 'text/html; charset=utf-8',
+          'Set-Cookie': `session_token=${sessionToken}; Path=/; Secure; SameSite=Strict; Max-Age=28800`
+        }
+      });
+    } else {
+      console.log('Session expired or not found');
+    }
+  }
+  
+  // 未认证，重定向到登录
+  return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(p)}`, 302);
 }
 
 // ---------------- API handler ----------------
@@ -1058,6 +1081,7 @@ function renderLoginHTML() {
 let loginInProgress = false;
 
 async function login() {
+
   if (loginInProgress) return;
   
   const password = document.getElementById('password').value;
@@ -1088,9 +1112,19 @@ async function login() {
     });
     
     const result = await response.json();
+    console.log('Login response:', result);
     
     if (result.success && result.sessionToken) {
+      // 保存到 localStorage
       localStorage.setItem('cf_session_token', result.sessionToken);
+      
+      // 设置 Cookie（重要！）
+      document.cookie = `session_token=${result.sessionToken}; path=/; max-age=28800; SameSite=Strict`;
+      
+      console.log('Session saved to localStorage and Cookie');
+      console.log('Cookie:', document.cookie);
+      
+      // 跳转
       const urlParams = new URLSearchParams(window.location.search);
       const redirect = urlParams.get('redirect') || '/workers';
       window.location.href = redirect;
@@ -1102,6 +1136,7 @@ async function login() {
       loginInProgress = false;
     }
   } catch (error) {
+    console.error('Login error:', error);
     errorDiv.textContent = '网络错误：' + error.message;
     errorDiv.style.display = 'block';
     btn.disabled = false;
@@ -1109,6 +1144,7 @@ async function login() {
     loginInProgress = false;
   }
 }
+
 </script>
 </body>
 </html>`;
