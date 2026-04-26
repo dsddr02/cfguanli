@@ -1,6 +1,10 @@
-name = "round-art-c1a0"
-main = "_worker.js"
+name = "fandi"
+main = "worker.js"
+compatibility_date = "2024-01-01"
 
+[[kv_namespaces]]
+binding = "MY_KV"
+id = "your-kv-id"  # 替换为实际 ID
 
-compatibility_date = "2025-03-30"
-workers_dev = true
+[build]
+command = "echo 'Build complete'"
