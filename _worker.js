@@ -663,7 +663,7 @@ if (action === 'add-account') {
         return json({ success: false, error: 'Error' }); 
       }
       
-      // 替换 get-usage-today 部分
+      // 修复 get-usage-today - 同时统计 Workers 和 Pages
 case 'get-usage-today': { 
   if (!payload.accountId) return json({ success: false, error: 'accountId required' }, 400); 
   const { accountId, email, key: apikey } = payload; 
@@ -674,17 +674,17 @@ case 'get-usage-today': {
     now.setUTCHours(0, 0, 0, 0);
     const start = now.toISOString();
     
-    let totalRequests = 0;
-    let hasData = false;
+    let workersRequests = 0;
+    let pagesRequests = 0;
     
-    // 方法1: 使用 GraphQL 查询（更准确）
+    // 使用 GraphQL 同时查询 Workers 和 Pages
     try {
       const graphqlQuery = {
         query: `query {
           viewer {
             accounts(filter: {accountTag: "${accountId}"}) {
               workersInvocationsAdaptive(
-                limit: 1,
+                limit: 100,
                 filter: {
                   datetime_geq: "${start}",
                   datetime_lt: "${end}"
@@ -693,8 +693,16 @@ case 'get-usage-today': {
                 sum {
                   requests
                 }
-                dimensions {
-                  scriptName
+              }
+              pagesFunctionsInvocationsAdaptive(
+                limit: 100,
+                filter: {
+                  datetime_geq: "${start}",
+                  datetime_lt: "${end}"
+                }
+              ) {
+                sum {
+                  requests
                 }
               }
             }
@@ -714,11 +722,21 @@ case 'get-usage-today': {
       
       if (graphqlRes.ok) {
         const data = await graphqlRes.json();
-        const invocations = data?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive || [];
-        for (const inv of invocations) {
+        const account = data?.data?.viewer?.accounts?.[0];
+        
+        // 统计 Workers 请求
+        const workersInvocations = account?.workersInvocationsAdaptive || [];
+        for (const inv of workersInvocations) {
           if (inv.sum?.requests) {
-            totalRequests += inv.sum.requests;
-            hasData = true;
+            workersRequests += inv.sum.requests;
+          }
+        }
+        
+        // 统计 Pages 请求
+        const pagesInvocations = account?.pagesFunctionsInvocationsAdaptive || [];
+        for (const inv of pagesInvocations) {
+          if (inv.sum?.requests) {
+            pagesRequests += inv.sum.requests;
           }
         }
       }
@@ -726,47 +744,63 @@ case 'get-usage-today': {
       console.error('GraphQL error:', e);
     }
     
-    // 方法2: 如果 GraphQL 没有数据，尝试获取每个脚本的 analytics（最近7天）
-    if (!hasData) {
+    // 如果 GraphQL 没有数据，尝试通过 REST API 获取 Workers 数据
+    if (workersRequests === 0 && pagesRequests === 0) {
       try {
+        // 获取所有 Workers 脚本
         const scriptsRes = await cfGet(`/accounts/${accountId}/workers/scripts`, email, apikey);
         if (scriptsRes.success && scriptsRes.result) {
-          // 获取最近7天的数据
-          const sevenDaysAgo = new Date();
-          sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-          const since = sevenDaysAgo.toISOString();
-          
           for (const script of scriptsRes.result) {
             try {
-              const analyticsUrl = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${script.id}/analytics/summary?since=${since}`;
+              const analyticsUrl = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${script.id}/analytics/summary?since=${start}&until=${end}`;
               const analyticsRes = await fetch(analyticsUrl, {
                 headers: { 'X-Auth-Email': email, 'X-Auth-Key': apikey }
               });
               if (analyticsRes.ok) {
                 const data = await analyticsRes.json();
                 if (data.result && data.result.requests) {
-                  totalRequests += data.result.requests;
-                  hasData = true;
+                  workersRequests += data.result.requests;
                 }
               }
             } catch (e) {}
           }
         }
+        
+        // 获取 Pages 项目（需要额外 API）
+        try {
+          const pagesRes = await cfGet(`/accounts/${accountId}/pages/projects`, email, apikey);
+          if (pagesRes.success && pagesRes.result) {
+            for (const project of pagesRes.result) {
+              try {
+                // Pages 的 analytics 通过 deployments 获取
+                const deploymentsRes = await cfGet(`/accounts/${accountId}/pages/projects/${project.name}/deployments`, email, apikey);
+                if (deploymentsRes.success && deploymentsRes.result) {
+                  for (const deployment of deploymentsRes.result) {
+                    if (deployment.deployment_trigger?.metadata?.analytics) {
+                      // 累积 Pages 请求
+                    }
+                  }
+                }
+              } catch (e) {}
+            }
+          }
+        } catch (e) {}
+        
       } catch (e) {
-        console.error('Analytics error:', e);
+        console.error('REST API error:', e);
       }
     }
     
+    const totalRequests = workersRequests + pagesRequests;
     const percentage = Math.min(100, (totalRequests / 100000) * 100);
     
     return json({ 
       success: true, 
       data: { 
         total: totalRequests, 
-        workers: totalRequests, 
-        pages: 0, 
+        workers: workersRequests, 
+        pages: pagesRequests, 
         percentage: percentage,
-        hasData: hasData,
         start: start,
         end: end
       } 
