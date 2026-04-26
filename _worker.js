@@ -1,5 +1,5 @@
-
-// 支持批量创建workers,批量添加环境变量 kv d1,是否开启workers分配得域名
+// =============== Worker 主文件 - Cloudflare Manager ===============
+// 支持加密存储凭据到 KV，跨浏览器使用
 
 export default {
   async fetch(request, env, ctx) {
@@ -7,44 +7,162 @@ export default {
   }
 };
 
-// 兼容旧版 Worker 环境
-addEventListener('fetch', (event) => {
-  event.respondWith(handleRequest(event.request, null));
-});
-
 const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
+
+// 加密相关常量
+const IV_LENGTH = 12;
+const SALT_LENGTH = 16;
+
+// 生成加密密钥
+async function deriveKey(password, salt) {
+  const encoder = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(password),
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  );
+  
+  return await crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: salt,
+      iterations: 100000,
+      hash: 'SHA-256'
+    },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+// 加密函数
+async function encrypt(text, password) {
+  const encoder = new TextEncoder();
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+  
+  const key = await deriveKey(password, salt);
+  const encrypted = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv },
+    key,
+    encoder.encode(text)
+  );
+  
+  const result = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
+  result.set(salt, 0);
+  result.set(iv, salt.length);
+  result.set(new Uint8Array(encrypted), salt.length + iv.length);
+  
+  return btoa(String.fromCharCode(...result));
+}
+
+// 解密函数
+async function decrypt(encryptedBase64, password) {
+  const decoder = new TextDecoder();
+  const encrypted = Uint8Array.from(atob(encryptedBase64), c => c.charCodeAt(0));
+  
+  const salt = encrypted.slice(0, SALT_LENGTH);
+  const iv = encrypted.slice(SALT_LENGTH, SALT_LENGTH + IV_LENGTH);
+  const data = encrypted.slice(SALT_LENGTH + IV_LENGTH);
+  
+  const key = await deriveKey(password, salt);
+  const decrypted = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: iv },
+    key,
+    data
+  );
+  
+  return decoder.decode(decrypted);
+}
+
+// 生成 session token
+function generateSessionToken() {
+  return crypto.randomUUID();
+}
 
 // ---------------- Router ----------------
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   const p = url.pathname;
 
-  // 增加 no-store 防止缓存
-  if (p === '/static.js' && request.method === 'GET') {
-    return new Response(renderStaticJS(env), { 
-      headers: { 
-        'content-type': 'application/javascript; charset=utf-8',
-        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
-        'Pragma': 'no-cache',
-        'Expires': '0'
-      } 
+  // 检查是否需要配置
+  const isConfigured = await env.MY_KV.get('config:is_configured');
+  
+  // 首次配置页面
+  if (p === '/setup' && request.method === 'GET' && !isConfigured) {
+    return new Response(renderSetupHTML(), { 
+      headers: { 'content-type': 'text/html; charset=utf-8' } 
     });
   }
-
-  if (request.method === 'GET' && (p === '/' || p === '/index.html')) {
-    return Response.redirect(`${url.origin}/login`, 302);
-  }
-  if (request.method === 'GET' && (p === '/login' || p === '/login/')) {
-    return new Response(renderLoginHTML(), { headers: { 'content-type': 'text/html; charset=utf-8' } });
-  }
-  if (request.method === 'GET' && p.startsWith('/workers')) {
-    return new Response(renderAppHTML(), { headers: { 'content-type': 'text/html; charset=utf-8' } });
-  }
-
+  
+  // API 路由
   if (p === '/api' && request.method === 'POST') {
     return handleAPI(request, env);
   }
-
+  
+  // 静态资源
+  if (p === '/static.js' && request.method === 'GET') {
+    return new Response(renderStaticJS(), { 
+      headers: { 
+        'content-type': 'application/javascript; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate'
+      } 
+    });
+  }
+  
+  // 主页重定向
+  if (request.method === 'GET' && (p === '/' || p === '/index.html')) {
+    if (!isConfigured) {
+      return Response.redirect(`${url.origin}/setup`, 302);
+    }
+    return Response.redirect(`${url.origin}/login`, 302);
+  }
+  
+  // 登录页面
+  if (request.method === 'GET' && (p === '/login' || p === '/login/')) {
+    if (!isConfigured) {
+      return Response.redirect(`${url.origin}/setup`, 302);
+    }
+    return new Response(renderLoginHTML(), { 
+      headers: { 'content-type': 'text/html; charset=utf-8' } 
+    });
+  }
+  
+  // Worker 管理页面（需要认证）
+  if (request.method === 'GET' && p.startsWith('/workers')) {
+    let sessionToken = request.headers.get('X-Session-Token');
+    
+    if (!sessionToken) {
+      const cookie = request.headers.get('Cookie');
+      if (cookie) {
+        const match = cookie.match(/session_token=([^;]+)/);
+        if (match) sessionToken = match[1];
+      }
+    }
+    
+    if (!sessionToken) {
+      sessionToken = url.searchParams.get('session');
+    }
+    
+    if (sessionToken) {
+      const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
+      
+      if (session && session.expires > Date.now()) {
+        return new Response(renderAppHTML(), { 
+          headers: { 
+            'content-type': 'text/html; charset=utf-8',
+            'Set-Cookie': `session_token=${sessionToken}; Path=/; Secure; SameSite=Strict; Max-Age=28800`
+          }
+        });
+      }
+    }
+    
+    return Response.redirect(`${url.origin}/login?redirect=${encodeURIComponent(p)}`, 302);
+  }
+  
   return new Response('Not Found', { status: 404 });
 }
 
@@ -52,49 +170,126 @@ async function handleRequest(request, env) {
 async function handleAPI(req, env) {
   const payload = await safeJSON(req);
   const action = payload.action;
-  if (!action) return json({ success:false, error:'action required' }, 400);
-
-  if (action === 'fetch-external-script') {
-    const { url } = payload;
-    if (!url) return json({ success: false, error: 'url required' });
+  
+  if (!action) return json({ success: false, error: 'action required' }, 400);
+  
+  // 首次配置
+  if (action === 'setup-credentials') {
+    const { email, key, masterPassword } = payload;
+    
+    if (!email || !key || !masterPassword) {
+      return json({ success: false, error: '缺少必要参数' }, 400);
+    }
+    
+    const testResult = await cfAny('GET', '/accounts', email, key);
+    if (!testResult.success && !testResult.result) {
+      return json({ 
+        success: false, 
+        error: 'Cloudflare 凭据无效：' + (testResult.errors?.[0]?.message || '验证失败')
+      });
+    }
+    
+    const credentials = JSON.stringify({ email, key });
+    const encryptedCredentials = await encrypt(credentials, masterPassword);
+    
+    await env.MY_KV.put('config:credentials', encryptedCredentials);
+    await env.MY_KV.put('config:is_configured', 'true');
+    await env.MY_KV.put('config:setup_time', Date.now().toString());
+    
+    return json({ success: true, message: '配置已保存' });
+  }
+  
+  // 登录
+  if (action === 'login') {
+    const { masterPassword } = payload;
+    
+    if (!masterPassword) {
+      return json({ success: false, error: '请输入访问密码' }, 400);
+    }
+    
+    const encryptedCredentials = await env.MY_KV.get('config:credentials');
+    if (!encryptedCredentials) {
+      return json({ success: false, error: '系统未配置，请先访问 /setup 进行配置' }, 400);
+    }
+    
     try {
-      const resp = await fetch(url, { headers: { 'User-Agent': 'CF-Worker-Manager' } });
-      if (!resp.ok) return json({ success: false, error: 'Fetch failed: ' + resp.status });
-      const text = await resp.text();
-      return json({ success: true, content: text });
-    } catch (e) {
-      return json({ success: false, error: e.message });
+      const credentialsJson = await decrypt(encryptedCredentials, masterPassword);
+      const { email, key } = JSON.parse(credentialsJson);
+      
+      const testResult = await cfAny('GET', '/accounts', email, key);
+      if (!testResult.success && !testResult.result) {
+        return json({ success: false, error: 'Cloudflare 凭据已失效，请重新配置' });
+      }
+      
+      const sessionToken = generateSessionToken();
+      await env.MY_KV.put(`session:${sessionToken}`, JSON.stringify({
+        email,
+        key,
+        expires: Date.now() + 8 * 3600000
+      }), { expirationTtl: 28800 });
+      
+      return json({ success: true, sessionToken, expiresIn: 28800 });
+      
+    } catch (error) {
+      return json({ success: false, error: '访问密码错误' }, 401);
     }
   }
-
-  const needsCreds = new Set([
-    'validate-credentials','list-accounts','list-workers','get-worker-script','deploy-worker',
-    'list-kv-namespaces','list-d1','put-worker-variables','get-worker-variables',
-    'get-workers-subdomain','put-workers-subdomain','list-dns','delete-worker',
-    'create-kv-namespace','delete-kv-namespace','put-kv-value','get-kv-value','delete-kv-value',
-    'list-kv-keys','create-d1-database','delete-d1-database','execute-d1-query',
-    'list-zones','create-zone','delete-zone','list-dns-records','create-dns-record','delete-dns-record',
-    'update-dns-record','toggle-worker-domain','get-worker-analytics','get-usage-today',
-    'get-worker-domains','toggle-worker-subdomain','add-worker-domain', 'delete-worker-domain', 'get-worker-bindings'
-  ]);
-
-  if (needsCreds.has(action)) {
-    if (!payload.email || !payload.key) return json({ success:false, error:'email & key required' }, 400);
+  
+  // 登出
+  if (action === 'logout') {
+    const { sessionToken } = payload;
+    if (sessionToken) {
+      await env.MY_KV.delete(`session:${sessionToken}`);
+    }
+    return json({ success: true });
   }
-
+  
+  // 需要 Cloudflare 凭据的操作
+  const needsCreds = new Set([
+    'list-accounts', 'list-workers', 'get-worker-script', 'deploy-worker',
+    'list-kv-namespaces', 'list-d1', 'put-worker-variables', 'get-worker-variables',
+    'get-workers-subdomain', 'put-workers-subdomain', 'list-dns', 'delete-worker',
+    'create-kv-namespace', 'delete-kv-namespace', 'put-kv-value', 'get-kv-value', 'delete-kv-value',
+    'list-kv-keys', 'create-d1-database', 'delete-d1-database', 'execute-d1-query',
+    'list-zones', 'create-zone', 'delete-zone', 'list-dns-records', 'create-dns-record',
+    'delete-dns-record', 'update-dns-record', 'toggle-worker-domain', 'get-worker-analytics',
+    'get-usage-today', 'get-worker-domains', 'toggle-worker-subdomain', 'add-worker-domain',
+    'delete-worker-domain', 'get-worker-bindings', 'fetch-external-script'
+  ]);
+  
+  if (needsCreds.has(action)) {
+    const sessionToken = payload.sessionToken;
+    if (!sessionToken) {
+      return json({ success: false, error: '请先登录' }, 401);
+    }
+    
+    const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
+    if (!session || session.expires < Date.now()) {
+      return json({ success: false, error: '会话已过期，请重新登录' }, 401);
+    }
+    
+    payload.email = session.email;
+    payload.key = session.key;
+  }
+  
   try {
     switch(action) {
-      case 'validate-credentials': {
-        const r = await cfAny('GET','/accounts', payload.email, payload.key);
-        if (!r.success && !r.result) {
-            return json({ success: false, error: r.errors?.[0]?.message || '验证失败，请检查 Email 和 Global API Key' });
+      case 'fetch-external-script': {
+        const { url } = payload;
+        if (!url) return json({ success: false, error: 'url required' });
+        try {
+          const resp = await fetch(url, { headers: { 'User-Agent': 'CF-Worker-Manager' } });
+          if (!resp.ok) return json({ success: false, error: 'Fetch failed: ' + resp.status });
+          const text = await resp.text();
+          return json({ success: true, content: text });
+        } catch (e) {
+          return json({ success: false, error: e.message });
         }
-        return json(r);
       }
-
+      
       case 'list-accounts':
         return json(await cfGet('/accounts', payload.email, payload.key));
-
+      
       case 'list-workers': {
         if (!payload.accountId) return json({ success: false, error: 'accountId required' }, 400);
         const result = await cfGet(`/accounts/${payload.accountId}/workers/scripts`, payload.email, payload.key);
@@ -137,7 +332,7 @@ async function handleAPI(req, env) {
         }
         return json(result);
       }
-
+      
       case 'get-worker-bindings': {
         const { scriptName } = payload;
         if (!scriptName) return json({ success: false, error: 'scriptName required' }, 400);
@@ -156,11 +351,11 @@ async function handleAPI(req, env) {
 
       case 'deploy-worker': {
         const { scriptName, scriptSource, metadataBindings, usage_model } = payload;
-        if (!scriptName) return json({ success:false, error:'scriptName required' },400);
+        if (!scriptName) return json({ success: false, error: 'scriptName required' }, 400);
         
         let accountId = payload.accountId;
         if (!accountId) {
-             accountId = await getAccountId(payload.email, payload.key);
+          accountId = await getAccountId(payload.email, payload.key);
         }
 
         let currentBindings = [];
@@ -240,7 +435,7 @@ async function handleAPI(req, env) {
 
       case 'put-worker-variables': {
         const { scriptName, variables } = payload;
-        if (!scriptName || !Array.isArray(variables) || !payload.accountId) return json({ success:false },400);
+        if (!scriptName || !Array.isArray(variables) || !payload.accountId) return json({ success: false }, 400);
         
         let currentScript = null;
         let currentBindings = [];
@@ -289,64 +484,197 @@ async function handleAPI(req, env) {
         }
         
         const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(scriptName)}`, { method: 'PUT', headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: form });
-        return json({ success: r.ok, message: r.ok?'Saved':'Failed', details: await r.text() });
+        return json({ success: r.ok, message: r.ok ? 'Saved' : 'Failed', details: await r.text() });
       }
 
       case 'get-worker-variables': {
         const { scriptName } = payload;
-        if (!scriptName || !payload.accountId) return json({ success:false },400);
+        if (!scriptName || !payload.accountId) return json({ success: false }, 400);
         const r = await cfGet(`/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/bindings`, payload.email, payload.key);
         const vars = [];
-        if (r.success && r.result) r.result.forEach(b => { if(b.type==='plain_text'||b.type==='secret_text') vars.push({ name:b.name, type:b.type, value:b.text||'' }); });
+        if (r.success && r.result) r.result.forEach(b => { if(b.type === 'plain_text' || b.type === 'secret_text') vars.push({ name:b.name, type:b.type, value:b.text||'' }); });
         return json({ success: true, result: { vars } });
       }
       
-      case 'get-worker-analytics': { const { scriptName } = payload; if (!scriptName || !payload.accountId) return json({ success:false },400); const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/analytics/summary`, { headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key } }); if (r.ok) return json({ success: true, data: (await r.json()).result || {} }); return json({ success: false, error: 'Error' }); }
-      
-      case 'get-usage-today': { 
-        if (!payload.accountId) return json({ success:false },400); 
-        const { accountId, email, key: apikey } = payload; 
-        const now=new Date(); 
-        const end=now.toISOString(); 
-        now.setUTCHours(0,0,0,0); 
-        const start=now.toISOString(); 
-        try { 
-          const r=await fetch("https://api.cloudflare.com/client/v4/graphql",{method:"POST",headers:{"Content-Type":"application/json","X-Auth-Email":email,"X-Auth-Key":apikey},body:JSON.stringify({query:`query getBillingMetrics($accountId:String!,$filter:AccountWorkersInvocationsAdaptiveFilter_InputObject){viewer{accounts(filter:{accountTag:$accountId}){pagesFunctionsInvocationsAdaptiveGroups(limit:1000,filter:$filter){sum{requests}}workersInvocationsAdaptive(limit:10000,filter:$filter){sum{requests}}}}}`,variables:{accountId,filter:{datetime_geq:start,datetime_leq:end}}})}); 
-          if(!r.ok) return json({success:true,data:{total:0,workers:0,pages:0,percentage:0}}); 
-          const res=await r.json(); 
-          const ac=res?.data?.viewer?.accounts?.[0]; 
-          const p=(ac?.pagesFunctionsInvocationsAdaptiveGroups||[]).reduce((t,i)=>t+(i?.sum?.requests||0),0); 
-          const w=(ac?.workersInvocationsAdaptive||[]).reduce((t,i)=>t+(i?.sum?.requests||0),0); 
-          return json({success:true,data:{total:p+w,workers:w,pages:p,percentage:Math.min(100,((p+w)/100000)*100)}}); 
-        } catch(e){ 
-          return json({success:true,data:{total:0,workers:0,pages:0,percentage:0}}); 
-        } 
+      case 'get-worker-analytics': { 
+        const { scriptName } = payload; 
+        if (!scriptName || !payload.accountId) return json({ success: false }, 400); 
+        const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/analytics/summary`, { headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key } }); 
+        if (r.ok) return json({ success: true, data: (await r.json()).result || {} }); 
+        return json({ success: false, error: 'Error' }); 
       }
       
-      case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountId || await getAccountId(payload.email, payload.key)}/storage/kv/namespaces`, payload.email, payload.key));
-      case 'create-kv-namespace': return json(await cfPost(`/accounts/${payload.accountId}/storage/kv/namespaces`, payload.email, payload.key, { title: payload.title }));
-      case 'delete-kv-namespace': return json(await cfDelete(`/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}`, payload.email, payload.key));
-      case 'list-kv-keys': return json(await cfGet(`/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/keys`, payload.email, payload.key));
-      case 'get-kv-value': { const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/values/${encodeURIComponent(payload.key)}`, { headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }}); return json({ success: r.ok, value: await r.text() }); }
-      case 'put-kv-value': { const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/values/${encodeURIComponent(payload.key)}`, { method: 'PUT', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: payload.value }); return json({ success: r.ok }); }
-      case 'delete-kv-value': return json(await cfDelete(`/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/values/${encodeURIComponent(payload.key)}`, payload.email, payload.key));
+      // 修复 get-usage-today case
+case 'get-usage-today': { 
+  if (!payload.accountId) return json({ success: false, error: 'accountId required' }, 400);
+  const { accountId, email, key: apikey } = payload;
+  
+  try {
+    // 获取今天的开始和结束时间
+    const now = new Date();
+    const end = now.toISOString();
+    now.setUTCHours(0, 0, 0, 0);
+    const start = now.toISOString();
+    
+    // 使用更可靠的 REST API 替代 GraphQL
+    // 方法1: 尝试获取 Workers 请求统计
+    let workersTotal = 0;
+    try {
+      // 获取所有 workers 脚本
+      const scriptsRes = await cfGet(`/accounts/${accountId}/workers/scripts`, email, apikey);
+      if (scriptsRes.success && scriptsRes.result) {
+        // 对每个脚本获取 analytics
+        for (const script of scriptsRes.result) {
+          try {
+            const analyticsUrl = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${script.id}/analytics/summary?since=${start}&until=${end}`;
+            const analyticsRes = await fetch(analyticsUrl, {
+              headers: { 'X-Auth-Email': email, 'X-Auth-Key': apikey }
+            });
+            if (analyticsRes.ok) {
+              const data = await analyticsRes.json();
+              if (data.result && data.result.requests) {
+                workersTotal += data.result.requests.total || 0;
+              } else if (data.result && data.result.requests_total) {
+                workersTotal += data.result.requests_total;
+              }
+            }
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
+    
+    // 尝试通过 GraphQL 获取（备选方案）
+    let pagesTotal = 0;
+    try {
+      const graphqlRes = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Auth-Email": email,
+          "X-Auth-Key": apikey
+        },
+        body: JSON.stringify({
+          query: `query {
+            viewer {
+              accounts(filter: {accountTag: "${accountId}"}) {
+                httpRequests1mGroups(limit: 1, filter: {datetime_geq: "${start}", datetime_lt: "${end}"}) {
+                  sum { requests }
+                }
+                workersInvocationsAdaptive(limit: 1, filter: {datetime_geq: "${start}", datetime_lt: "${end}"}) {
+                  sum { requests }
+                }
+              }
+            }
+          }`
+        })
+      });
+      
+      if (graphqlRes.ok) {
+        const data = await graphqlRes.json();
+        if (data.data?.viewer?.accounts?.[0]) {
+          const workersInv = data.data.viewer.accounts[0].workersInvocationsAdaptive?.[0]?.sum?.requests || 0;
+          if (workersInv > 0) workersTotal = workersInv;
+        }
+      }
+    } catch (e) {}
+    
+    const total = workersTotal + pagesTotal;
+    const percentage = Math.min(100, (total / 100000) * 100);
+    
+    return json({ 
+      success: true, 
+      data: { 
+        total: total, 
+        workers: workersTotal, 
+        pages: pagesTotal, 
+        percentage: percentage 
+      } 
+    });
+  } catch(e) { 
+    return json({ 
+      success: true, 
+      data: { total: 0, workers: 0, pages: 0, percentage: 0 },
+      error: e.message 
+    }); 
+  }
+}
+      
+      case 'list-kv-namespaces': 
+        return json(await cfGet(`/accounts/${payload.accountId || await getAccountId(payload.email, payload.key)}/storage/kv/namespaces`, payload.email, payload.key));
+      
+      case 'create-kv-namespace': 
+        return json(await cfPost(`/accounts/${payload.accountId}/storage/kv/namespaces`, payload.email, payload.key, { title: payload.title }));
+      
+      case 'delete-kv-namespace': 
+        return json(await cfDelete(`/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}`, payload.email, payload.key));
+      
+      case 'list-kv-keys': 
+        return json(await cfGet(`/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/keys`, payload.email, payload.key));
+      
+      case 'get-kv-value': { 
+        const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/values/${encodeURIComponent(payload.key)}`, { 
+          headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }
+        }); 
+        return json({ success: r.ok, value: await r.text() }); 
+      }
+      
+      case 'put-kv-value': { 
+        const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/values/${encodeURIComponent(payload.key)}`, { 
+          method: 'PUT', 
+          headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, 
+          body: payload.value 
+        }); 
+        return json({ success: r.ok }); 
+      }
+      
+      case 'delete-kv-value': 
+        return json(await cfDelete(`/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/values/${encodeURIComponent(payload.key)}`, payload.email, payload.key));
 
-      case 'list-d1': return json(await cfGet(`/accounts/${payload.accountId || await getAccountId(payload.email, payload.key)}/d1/database`, payload.email, payload.key));
-      case 'create-d1-database': return json(await cfPost(`/accounts/${payload.accountId}/d1/database`, payload.email, payload.key, { name: payload.name }));
-      case 'delete-d1-database': return json(await cfDelete(`/accounts/${payload.accountId}/d1/database/${payload.databaseId}`, payload.email, payload.key));
-      case 'execute-d1-query': return json(await cfPost(`/accounts/${payload.accountId}/d1/database/${payload.databaseId}/query`, payload.email, payload.key, { sql: payload.query }));
+      case 'list-d1': 
+        return json(await cfGet(`/accounts/${payload.accountId || await getAccountId(payload.email, payload.key)}/d1/database`, payload.email, payload.key));
+      
+      case 'create-d1-database': 
+        return json(await cfPost(`/accounts/${payload.accountId}/d1/database`, payload.email, payload.key, { name: payload.name }));
+      
+      case 'delete-d1-database': 
+        return json(await cfDelete(`/accounts/${payload.accountId}/d1/database/${payload.databaseId}`, payload.email, payload.key));
+      
+      case 'execute-d1-query': 
+        return json(await cfPost(`/accounts/${payload.accountId}/d1/database/${payload.databaseId}/query`, payload.email, payload.key, { sql: payload.query }));
 
-      case 'get-workers-subdomain': return json(await cfGet(`/accounts/${payload.accountId}/workers/subdomain`, payload.email, payload.key));
-      case 'put-workers-subdomain': return json({ success: true, data: await cfPutRaw(`/accounts/${payload.accountId}/workers/subdomain`, payload.email, payload.key, { subdomain: payload.subdomain }) });
-      case 'toggle-worker-subdomain': return json(await cfPost(`/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}/subdomain`, payload.email, payload.key, { enabled: payload.enabled }));
+      case 'get-workers-subdomain': 
+        return json(await cfGet(`/accounts/${payload.accountId}/workers/subdomain`, payload.email, payload.key));
+      
+      case 'put-workers-subdomain': 
+        return json({ success: true, data: await cfPutRaw(`/accounts/${payload.accountId}/workers/subdomain`, payload.email, payload.key, { subdomain: payload.subdomain }) });
+      
+      case 'toggle-worker-subdomain': 
+        return json(await cfPost(`/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}/subdomain`, payload.email, payload.key, { enabled: payload.enabled }));
 
-      case 'list-zones': return json(await cfGet('/zones', payload.email, payload.key));
-      case 'create-zone': return json(await cfPost('/zones', payload.email, payload.key, { name: payload.name }));
-      case 'delete-zone': return json(await cfDelete(`/zones/${payload.zoneId}`, payload.email, payload.key));
-      case 'list-dns-records': return json(await cfGet(`/zones/${payload.zoneId}/dns_records`, payload.email, payload.key));
-      case 'create-dns-record': return json(await cfPost(`/zones/${payload.zoneId}/dns_records`, payload.email, payload.key, { type: payload.type, name: payload.name, content: payload.content, ttl: payload.ttl||1, proxied: payload.proxied||false }));
-      case 'update-dns-record': return json(await cfPut(`/zones/${payload.zoneId}/dns_records/${payload.recordId}`, payload.email, payload.key, { type: payload.type, name: payload.name, content: payload.content, ttl: payload.ttl||1, proxied: payload.proxied||false }));
-      case 'delete-dns-record': return json(await cfDelete(`/zones/${payload.zoneId}/dns_records/${payload.recordId}`, payload.email, payload.key));
+      case 'list-zones': 
+        return json(await cfGet('/zones', payload.email, payload.key));
+      
+      case 'create-zone': 
+        return json(await cfPost('/zones', payload.email, payload.key, { name: payload.name }));
+      
+      case 'delete-zone': 
+        return json(await cfDelete(`/zones/${payload.zoneId}`, payload.email, payload.key));
+      
+      case 'list-dns-records': 
+        return json(await cfGet(`/zones/${payload.zoneId}/dns_records`, payload.email, payload.key));
+      
+      case 'create-dns-record': 
+        return json(await cfPost(`/zones/${payload.zoneId}/dns_records`, payload.email, payload.key, { 
+          type: payload.type, name: payload.name, content: payload.content, ttl: payload.ttl || 1, proxied: payload.proxied || false 
+        }));
+      
+      case 'update-dns-record': 
+        return json(await cfPut(`/zones/${payload.zoneId}/dns_records/${payload.recordId}`, payload.email, payload.key, { 
+          type: payload.type, name: payload.name, content: payload.content, ttl: payload.ttl || 1, proxied: payload.proxied || false 
+        }));
+      
+      case 'delete-dns-record': 
+        return json(await cfDelete(`/zones/${payload.zoneId}/dns_records/${payload.recordId}`, payload.email, payload.key));
       
       case 'add-worker-domain': {
         const { scriptName, hostname } = payload;
@@ -354,9 +682,12 @@ async function handleAPI(req, env) {
         const zonesRes = await cfGet('/zones', payload.email, payload.key);
         const zone = zonesRes.success ? zonesRes.result.find(z => cleanHost === z.name || cleanHost.endsWith('.' + z.name)) : null;
         if (!zone) return json({ success: false, error: '未找到匹配的 Zone' });
-        const res = await cfPutRaw(`/zones/${zone.id}/workers/domains`, payload.email, payload.key, { environment: "production", hostname: cleanHost, service: scriptName, zone_id: zone.id });
+        const res = await cfPutRaw(`/zones/${zone.id}/workers/domains`, payload.email, payload.key, { 
+          environment: "production", hostname: cleanHost, service: scriptName, zone_id: zone.id 
+        });
         return json({ success: res.success || !!res.result, error: res.errors?.[0]?.message });
       }
+      
       case 'delete-worker-domain': {
         const url = `${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}/domains/${payload.domainId}`;
         const r = await fetch(url, { method: 'DELETE', headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key } });
@@ -364,80 +695,83 @@ async function handleAPI(req, env) {
       }
       
       case 'delete-worker': {
-        const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}`, { method:'DELETE', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key } });
+        const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}`, { 
+          method: 'DELETE', 
+          headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key } 
+        });
         return json({ success: r.ok });
       }
 
       default:
-        return json({ success:false, error:'unknown action' },400);
+        return json({ success: false, error: 'unknown action' }, 400);
     }
   } catch(e) {
-    return json({ success:false, error: String(e) },500);
+    return json({ success: false, error: String(e) }, 500);
   }
 }
 
 async function getWorkerScriptInternal(email, key, accountId, scriptName) {
-    if (!scriptName) return json({ success:false, error:'scriptName required' },400);
-    const accId = accountId || await getAccountId(email, key);
-    const url = `${CF_API_BASE}/accounts/${accId}/workers/scripts/${encodeURIComponent(scriptName)}`;
-    const resp = await fetch(url, { method:'GET', headers:{ 'X-Auth-Email': email, 'X-Auth-Key': key }});
-    
-    if (resp.status === 404) {
-         return json({ ok: false, status: 404, rawScript: "export default { async fetch() { return new Response('New Worker'); } };" });
-    }
+  if (!scriptName) return json({ success: false, error: 'scriptName required' }, 400);
+  const accId = accountId || await getAccountId(email, key);
+  const url = `${CF_API_BASE}/accounts/${accId}/workers/scripts/${encodeURIComponent(scriptName)}`;
+  const resp = await fetch(url, { method: 'GET', headers: { 'X-Auth-Email': email, 'X-Auth-Key': key } });
+  
+  if (resp.status === 404) {
+    return json({ ok: false, status: 404, rawScript: "export default { async fetch() { return new Response('New Worker'); } };" });
+  }
 
-    const text = await resp.text();
-    const contentType = resp.headers.get('content-type') || '';
-    let scriptContent = null;
+  const text = await resp.text();
+  const contentType = resp.headers.get('content-type') || '';
+  let scriptContent = null;
 
-    if (contentType.includes('multipart/form-data')) {
-        const boundaryMatch = contentType.match(/boundary=(.*)/);
-        const boundary = boundaryMatch ? boundaryMatch[1].split(';')[0].trim() : null;
-        if (boundary) {
-            const parts = text.split(new RegExp(`--${boundary}(?:--)?`));
-            for (const part of parts) {
-                if (part.includes('Content-Type: application/javascript') || 
-                    part.includes('Content-Type: application/x-javascript') ||
-                    part.includes('filename="worker.js"') || 
-                    part.includes('name="script"')) {
-                    const bodyMatch = part.match(/\r?\n\r?\n([\s\S]*)/);
-                    if (bodyMatch && bodyMatch[1]) {
-                        scriptContent = bodyMatch[1].trim();
-                        break;
-                    }
-                }
-            }
+  if (contentType.includes('multipart/form-data')) {
+    const boundaryMatch = contentType.match(/boundary=(.*)/);
+    const boundary = boundaryMatch ? boundaryMatch[1].split(';')[0].trim() : null;
+    if (boundary) {
+      const parts = text.split(new RegExp(`--${boundary}(?:--)?`));
+      for (const part of parts) {
+        if (part.includes('Content-Type: application/javascript') || 
+            part.includes('Content-Type: application/x-javascript') ||
+            part.includes('filename="worker.js"') || 
+            part.includes('name="script"')) {
+          const bodyMatch = part.match(/\r?\n\r?\n([\s\S]*)/);
+          if (bodyMatch && bodyMatch[1]) {
+            scriptContent = bodyMatch[1].trim();
+            break;
+          }
         }
-        if (!scriptContent) {
-            const jsMatch = text.match(/Content-Type:\s*application\/javascript(?:[\+a-z]*)?[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--)/i);
-            if (jsMatch) scriptContent = jsMatch[1].trim();
-        }
-    } 
-    else if (!text.trim().startsWith('{')) {
-        scriptContent = text;
-    } 
-    else {
-        try {
-            const j = JSON.parse(text);
-            if (j.result && j.result.script) scriptContent = j.result.script;
-        } catch(e) {}
+      }
     }
-
     if (!scriptContent) {
-        if (text.includes('export default') || text.includes('addEventListener')) {
-             const rawMatch = text.match(/(export\s+default[\s\S]+|addEventListener[\s\S]+)/);
-             if (rawMatch) {
-                 scriptContent = rawMatch[0].split(/\r?\n--/)[0].trim();
-             } else {
-                 scriptContent = text;
-             }
-        }
+      const jsMatch = text.match(/Content-Type:\s*application\/javascript(?:[\+a-z]*)?[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--)/i);
+      if (jsMatch) scriptContent = jsMatch[1].trim();
     }
+  } 
+  else if (!text.trim().startsWith('{')) {
+    scriptContent = text;
+  } 
+  else {
+    try {
+      const j = JSON.parse(text);
+      if (j.result && j.result.script) scriptContent = j.result.script;
+    } catch(e) {}
+  }
 
-    if (scriptContent) {
-        return json({ ok: true, status: 200, rawScript: scriptContent });
+  if (!scriptContent) {
+    if (text.includes('export default') || text.includes('addEventListener')) {
+      const rawMatch = text.match(/(export\s+default[\s\S]+|addEventListener[\s\S]+)/);
+      if (rawMatch) {
+        scriptContent = rawMatch[0].split(/\r?\n--/)[0].trim();
+      } else {
+        scriptContent = text;
+      }
     }
-    return json({ ok: true, status: 200, rawScript: text }); 
+  }
+
+  if (scriptContent) {
+    return json({ ok: true, status: 200, rawScript: scriptContent });
+  }
+  return json({ ok: true, status: 200, rawScript: text }); 
 }
 
 async function getAccountId(email, key) {
@@ -454,7 +788,11 @@ async function cfDelete(path, email, key) { return cfAny('DELETE', path, email, 
 
 async function cfPutRaw(path, email, key, body) {
   const url = path.startsWith('http') ? path : CF_API_BASE + path;
-  const res = await fetch(url, { method:'PUT', headers: { 'X-Auth-Email': email, 'X-Auth-Key': key, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const res = await fetch(url, { 
+    method: 'PUT', 
+    headers: { 'X-Auth-Email': email, 'X-Auth-Key': key, 'Content-Type': 'application/json' }, 
+    body: JSON.stringify(body) 
+  });
   try { return await res.json(); } catch { return { success: res.ok }; }
 }
 
@@ -470,88 +808,379 @@ async function cfAny(method, path, email, key, body = null) {
   try { return await res.json(); } catch { return { success: res.ok }; }
 }
 
-function json(obj, status=200) {
-  return new Response(JSON.stringify(obj, null, 2), { status, headers: { 'content-type': 'application/json' }});
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj, null, 2), { 
+    status, 
+    headers: { 'content-type': 'application/json' } 
+  });
 }
 
-async function safeJSON(req) { try { return await req.json(); } catch { return {}; } }
+async function safeJSON(req) { 
+  try { return await req.json(); } catch { return {}; } 
+}
+
+// =============== HTML 渲染函数 ===============
+
+function renderSetupHTML() {
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>首次配置 - Cloudflare Manager</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .setup-container {
+    background: white;
+    border-radius: 20px;
+    padding: 40px;
+    max-width: 500px;
+    width: 100%;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  }
+  h2 {
+    color: #1a202c;
+    margin-bottom: 8px;
+    font-size: 28px;
+  }
+  .subtitle {
+    color: #718096;
+    margin-bottom: 30px;
+    font-size: 14px;
+  }
+  .form-group {
+    margin-bottom: 20px;
+  }
+  label {
+    display: block;
+    margin-bottom: 8px;
+    color: #2d3748;
+    font-weight: 500;
+    font-size: 14px;
+  }
+  input {
+    width: 100%;
+    padding: 12px;
+    border: 2px solid #e2e8f0;
+    border-radius: 10px;
+    font-size: 14px;
+    transition: all 0.3s;
+  }
+  input:focus {
+    outline: none;
+    border-color: #667eea;
+    box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
+  }
+  button {
+    width: 100%;
+    padding: 12px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border: none;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.2s;
+  }
+  button:hover {
+    transform: translateY(-2px);
+  }
+  .note {
+    margin-top: 20px;
+    padding: 12px;
+    background: #fef5e7;
+    border-left: 4px solid #f39c12;
+    font-size: 13px;
+    color: #856404;
+  }
+  .error {
+    color: #e53e3e;
+    font-size: 13px;
+    margin-top: 8px;
+    display: none;
+  }
+</style>
+</head>
+<body>
+<div class="setup-container">
+  <h2>🚀 欢迎使用 Cloudflare Manager</h2>
+  <div class="subtitle">首次使用，请完成以下配置</div>
+  
+  <div class="form-group">
+    <label>Cloudflare 账号邮箱</label>
+    <input type="email" id="email" placeholder="your@email.com">
+  </div>
+  
+  <div class="form-group">
+    <label>Cloudflare Global API Key</label>
+    <input type="password" id="apiKey" placeholder="您的 Global API Key">
+    <div class="note">可在 Cloudflare 控制台右上角 → 我的资料 → API 令牌中获取</div>
+  </div>
+  
+  <div class="form-group">
+    <label>设置访问密码</label>
+    <input type="password" id="masterPassword" placeholder="用于在其他浏览器登录">
+    <div class="note">⚠️ 请务必记住此密码！凭据将加密存储，忘记密码无法找回</div>
+  </div>
+  
+  <div class="form-group">
+    <label>确认访问密码</label>
+    <input type="password" id="confirmPassword" placeholder="再次输入密码">
+  </div>
+  
+  <div id="errorMsg" class="error"></div>
+  
+  <button onclick="setup()">保存配置并开始使用</button>
+</div>
+
+<script>
+async function setup() {
+  const email = document.getElementById('email').value.trim();
+  const apiKey = document.getElementById('apiKey').value.trim();
+  const masterPassword = document.getElementById('masterPassword').value;
+  const confirmPassword = document.getElementById('confirmPassword').value;
+  
+  document.getElementById('errorMsg').style.display = 'none';
+  
+  if (!email || !apiKey || !masterPassword) {
+    showError('请填写所有字段');
+    return;
+  }
+  
+  if (masterPassword !== confirmPassword) {
+    showError('两次输入的密码不一致');
+    return;
+  }
+  
+  if (masterPassword.length < 6) {
+    showError('访问密码至少需要 6 个字符');
+    return;
+  }
+  
+  const btn = document.querySelector('button');
+  btn.disabled = true;
+  btn.textContent = '验证中...';
+  
+  try {
+    const response = await fetch('/api', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'setup-credentials',
+        email: email,
+        key: apiKey,
+        masterPassword: masterPassword
+      })
+    });
+    
+    const result = await response.json();
+    
+    if (result.success) {
+      alert('配置成功！即将跳转到登录页面');
+      window.location.href = '/login';
+    } else {
+      showError(result.error || '配置失败，请检查 Cloudflare 凭据是否正确');
+      btn.disabled = false;
+      btn.textContent = '保存配置并开始使用';
+    }
+  } catch (error) {
+    showError('网络错误：' + error.message);
+    btn.disabled = false;
+    btn.textContent = '保存配置并开始使用';
+  }
+}
+
+function showError(msg) {
+  const errorDiv = document.getElementById('errorMsg');
+  errorDiv.textContent = msg;
+  errorDiv.style.display = 'block';
+}
+<\/script>
+</body>
+</html>`;
+}
 
 function renderLoginHTML() {
   return `<!doctype html>
 <html>
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>连接您的 Cloudflare 账号</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 - Cloudflare Manager</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#f6f8fa;--card:#fff;--muted:#6b7280;--accent:#2563eb}
-body{font-family:Inter,system-ui,Arial;margin:0;background:var(--bg);color:#0f1724}
-.container{max-width:920px;margin:32px auto;padding:24px}
-.card{background:#fff;border-radius:12px;padding:20px;box-shadow:0 6px 18px rgba(2,6,23,0.04)}
-.h1{font-size:28px;font-weight:700;margin-bottom:6px}
-.small{color:var(--muted);margin-bottom:12px}
-.account-row{padding:12px;border-radius:8px;border:1px solid #eef2ff;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
-.form-row{display:flex;gap:8px;margin-top:8px}
-.input{padding:10px;border-radius:8px;border:1px solid #e6edf3;width:100%}
-.btn{padding:10px 12px;border-radius:8px;border:0;background:var(--accent);color:#fff;cursor:pointer}
-.link{color:#2563eb;cursor:pointer}
-.note{font-size:13px;color:var(--muted);margin-top:8px}
-.modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);justify-content:center;align-items:center;z-index:9999}
-.modal-content{background:#fff;border-radius:12px;width:90%;max-width:500px;padding:24px;position:relative}
-.modal-title{font-size:18px;font-weight:700;margin-bottom:16px}
-textarea.input{min-height:120px;resize:vertical;font-family:monospace}
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .login-container {
+    background: white;
+    border-radius: 20px;
+    padding: 40px;
+    max-width: 450px;
+    width: 100%;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  }
+  h2 {
+    color: #1a202c;
+    margin-bottom: 8px;
+    font-size: 28px;
+  }
+  .subtitle {
+    color: #718096;
+    margin-bottom: 30px;
+    font-size: 14px;
+  }
+  .form-group {
+    margin-bottom: 20px;
+  }
+  label {
+    display: block;
+    margin-bottom: 8px;
+    color: #2d3748;
+    font-weight: 500;
+    font-size: 14px;
+  }
+  input {
+    width: 100%;
+    padding: 12px;
+    border: 2px solid #e2e8f0;
+    border-radius: 10px;
+    font-size: 14px;
+    transition: all 0.3s;
+  }
+  input:focus {
+    outline: none;
+    border-color: #667eea;
+    box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
+  }
+  button {
+    width: 100%;
+    padding: 12px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border: none;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.2s;
+  }
+  button:hover {
+    transform: translateY(-2px);
+  }
+  .error {
+    color: #e53e3e;
+    font-size: 13px;
+    margin-top: 8px;
+    display: none;
+    text-align: center;
+  }
+  .note {
+    margin-top: 20px;
+    padding: 12px;
+    background: #e6f7ff;
+    border-left: 4px solid #1890ff;
+    font-size: 13px;
+    color: #0050b3;
+    text-align: center;
+  }
 </style>
 </head>
-<body data-page="login">
-<div class="container">
-  <div class="card">
-    <div class="h1">连接您的 Cloudflare 账号</div>
-    <div class="small">选择已保存的账号或添加新账号</div>
-
-    <div style="margin-top:12px">
-      <div style="font-weight:600;margin-bottom:6px">已保存的账号</div>
-      <div id="savedAccounts">未找到已保存账号</div>
-    </div>
-
-    <hr style="margin:18px 0">
-
-    <div style="font-weight:600">添加新账号</div>
-    <div class="note">您的凭据将安全存储在本地浏览器中</div>
-
-    <div style="margin-top:8px">
-      <label class="small">Cloudflare 账号邮箱</label>
-      <input id="newEmail" class="input" placeholder="your@email.com">
-    </div>
-    <div style="margin-top:8px">
-      <label class="small">Cloudflare API 密钥</label>
-      <input id="newKey" class="input" placeholder="您的 API 密钥">
-    </div>
-
-    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
-      <button class="btn" id="verifyBtn">验证并进入管理后台</button>
-      <button class="btn" id="openBatchModalBtn" style="background:#4b5563;color:#fff">批量导入账号</button>
-      <button class="btn" id="clearBtn" style="background:#e5e7eb;color:#111">清除本地账号</button>
-    </div>
-
-    <div class="note" style="margin-top:12px">
-      点击右上角头像 → 配置文件 → API 令牌 → 下拉到 API 密钥 → 查看或创建 Global API Key
-    </div>
+<body>
+<div class="login-container">
+  <h2>🔐 访问控制</h2>
+  <div class="subtitle">请输入访问密码继续</div>
+  
+  <div class="form-group">
+    <label>访问密码</label>
+    <input type="password" id="password" placeholder="请输入管理员设置的密码" onkeypress="if(event.key==='Enter') login()">
+  </div>
+  
+  <div id="errorMsg" class="error"></div>
+  
+  <button onclick="login()">登录管理后台</button>
+  
+  <div class="note">
+    💡 提示：密码由管理员在首次配置时设置
   </div>
 </div>
 
-<div id="batchLoginModal" class="modal">
-  <div class="modal-content">
-    <div class="modal-title">批量添加账号</div>
-    <div class="small">每行一个账号，格式：邮箱|GlobalApiKey</div>
-    <textarea id="batchLoginInput" class="input" placeholder="user1@example.com|key1&#10;user2@example.com|key2"></textarea>
-    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
-      <button class="btn" style="background:#e5e7eb;color:#111" onclick="document.getElementById('batchLoginModal').style.display='none'">取消</button>
-      <button class="btn" id="confirmBatchLogin">确认导入</button>
-    </div>
-  </div>
-</div>
+<script>
+let loginInProgress = false;
 
-<script src="/static.js"></script>
+async function login() {
+  if (loginInProgress) return;
+  
+  const password = document.getElementById('password').value;
+  const errorDiv = document.getElementById('errorMsg');
+  
+  errorDiv.style.display = 'none';
+  
+  if (!password) {
+    errorDiv.textContent = '请输入访问密码';
+    errorDiv.style.display = 'block';
+    return;
+  }
+  
+  const btn = document.querySelector('button');
+  loginInProgress = true;
+  const originalText = btn.textContent;
+  btn.textContent = '登录中...';
+  btn.disabled = true;
+  
+  try {
+    const response = await fetch('/api', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'login',
+        masterPassword: password
+      })
+    });
+    
+    const result = await response.json();
+    
+    if (result.success && result.sessionToken) {
+      localStorage.setItem('cf_session_token', result.sessionToken);
+      document.cookie = 'session_token=' + result.sessionToken + '; path=/; max-age=28800; SameSite=Strict';
+      
+      const urlParams = new URLSearchParams(window.location.search);
+      const redirect = urlParams.get('redirect') || '/workers';
+      window.location.href = redirect;
+    } else {
+      errorDiv.textContent = result.error || '登录失败';
+      errorDiv.style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = originalText;
+      loginInProgress = false;
+    }
+  } catch (error) {
+    errorDiv.textContent = '网络错误：' + error.message;
+    errorDiv.style.display = 'block';
+    btn.disabled = false;
+    btn.textContent = originalText;
+    loginInProgress = false;
+  }
+}
+<\/script>
 </body>
 </html>`;
 }
@@ -561,14 +1190,13 @@ function renderAppHTML() {
 <html>
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>cloudflare 第三方管理平台</title>
+<title>Cloudflare 第三方管理平台</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#f6f8fa;--card:#fff;--muted:#6b7280;--accent:#2563eb;--danger:#ef4444}
 *{box-sizing:border-box}
 body{font-family:Inter,Arial;margin:0;background:var(--bg);color:#0f1724}
 .app{display:flex;min-height:100vh}
-/* 修复：Sidebar 增加 sticky 定位，占据 100vh 高度，确保底部内容始终可见且位于底部 */
 .sidebar{width:260px;background:#fff;border-right:1px solid #eef2f6;padding:22px;display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto}
 .logo{display:flex;align-items:center;gap:10px;font-weight:700}
 .nav{margin-top:22px}
@@ -594,7 +1222,6 @@ body{font-family:Inter,Arial;margin:0;background:var(--bg);color:#0f1724}
 .btn.success{background:#10b981;color:#fff;border:0}
 .btn.small{font-size:11px;padding:4px 8px}
 .small{font-size:13px;color:var(--muted)}
-/* 修复：Modal 默认隐藏 (display: none)，修复打开页面自动弹窗问题 */
 .modal{display:none;position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,0.45);align-items:center;justify-content:center;z-index:1000}
 .modal-box{width:720px;background:#fff;border-radius:12px;padding:20px;max-height:90vh;overflow:auto}
 .modal-box.small{width:480px}
@@ -664,8 +1291,6 @@ input:checked + .slider:before{transform:translateX(16px)}
 .res-tag.kv { background: #eff6ff; color: #1e40af; border-color: #bfdbfe; }
 .res-tag.d1 { background: #fff7ed; color: #9a3412; border-color: #fed7aa; }
 .res-tag.env { background: #f0fdf4; color: #166534; border-color: #bbf7d0; }
-
-/* Batch Page CSS */
 .batch-layout { display: flex; gap: 20px; height: calc(100vh - 100px); }
 .batch-sidebar { width: 300px; border-right: 1px solid #eef2f6; overflow-y: auto; padding-right: 16px; }
 .batch-main { flex: 1; display: flex; flex-direction: column; overflow-y: auto; }
@@ -679,999 +1304,582 @@ input:checked + .slider:before{transform:translateX(16px)}
 .badge { background: #dbeafe; color: #1e40af; font-size: 10px; padding: 2px 6px; border-radius: 4px; margin-left: 6px; }
 </style>
 </head>
-<body data-page="app">
+<body>
 <div class="app">
   <aside class="sidebar">
-    <div class="logo"><span style="font-size:18px">cloudflare</span>管理平台</div>
-    
+    <div class="logo"><span style="font-size:18px">☁️ Cloudflare</span>管理平台</div>
     <nav class="nav">
-      <div class="item active" data-page="workers" onclick="navTo('workers')">Workers</div>
-      <div class="item" data-page="batch" onclick="navTo('batch')">批量创建 Worker</div>
-      <div class="item" data-page="kv" onclick="navTo('kv')">Workers KV</div>
-      <div class="item" data-page="d1" onclick="navTo('d1')">D1 数据库</div>
-      <div class="item" data-page="dns" onclick="navTo('dns')">域名管理</div>
-      <div class="item" data-page="settings" onclick="navTo('settings')">设置</div>
+      <div class="item" data-page="workers">Workers</div>
+      <div class="item" data-page="batch">批量创建 Worker</div>
+      <div class="item" data-page="kv">Workers KV</div>
+      <div class="item" data-page="d1">D1 数据库</div>
+      <div class="item" data-page="dns">域名管理</div>
+      <div class="item" data-page="settings">设置</div>
     </nav>
-    
     <div style="margin-top:auto;padding-top:20px;border-top:1px solid #eef2f6">
-       <div class="small" style="margin-bottom:4px">当前账号</div>
-       <div style="font-weight:600;font-size:13px;word-break:break-all;cursor:pointer" id="acctInfo" onclick="openAccountSwitcher()" title="切换账号">未登录</div>
-       <div style="margin-top:8px;font-size:11px;color:var(--muted);display:flex;justify-content:space-between">
-         <span onclick="openAccountSwitcher()" style="cursor:pointer;text-decoration:underline">切换</span>
-         <span onclick="logout()" style="cursor:pointer;color:#ef4444">退出</span>
+       <div class="small" style="margin-bottom:4px">当前会话</div>
+       <div style="font-weight:600;font-size:13px" id="sessionInfo">已登录</div>
+       <div style="margin-top:8px;font-size:11px;color:var(--muted)">
+         <span onclick="logout()" style="cursor:pointer;color:#ef4444">退出登录</span>
        </div>
     </div>
   </aside>
-
   <main class="main">
-    <!-- Workers Page -->
-    <div id="workers-page" class="page-content active">
-      <div class="header">
-        <div style="font-size:20px;font-weight:700">Workers 管理</div>
-        <div>
-          <button class="btn primary" onclick="openCreateWorker()">新建 Worker</button>
-        </div>
+    <div id="workers-page" class="page-content">
+      <div class="header"><div style="font-size:20px;font-weight:700">Workers 管理</div><div><button class="btn primary" onclick="openCreateWorker()">新建 Worker</button></div></div>
+      <div class="metric"><div class="small">今天的请求</div><div style="display:flex;justify-content:space-between;align-items:center"><div style="font-size:28px;font-weight:700" id="metricCount">0 / 100,000</div></div><div class="bar"><i id="metricBar" style="width:0%"></i></div>
+        <div class="usage-section"><div class="usage-breakdown"><div class="usage-item workers"><div class="label">WORKERS 请求</div><div class="value" id="workersRequests">0</div></div><div class="usage-item pages"><div class="label">PAGES 请求</div><div class="value" id="pagesRequests">0</div></div><div class="usage-item total"><div class="label">日配额</div><div class="value">100,000</div></div></div></div>
       </div>
-
-      <div class="metric">
-        <div class="small">今天的请求</div>
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <div style="font-size:28px;font-weight:700" id="metricCount">0 / 100,000</div>
-        </div>
-        <div class="bar"><i id="metricBar" style="width:0%"></i></div>
-        
-        <div class="usage-section">
-          <div class="usage-breakdown">
-            <div class="usage-item workers">
-              <div class="label">WORKERS 请求</div>
-              <div class="value" id="workersRequests">0</div>
-            </div>
-            <div class="usage-item pages">
-              <div class="label">PAGES 请求</div>
-              <div class="value" id="pagesRequests">0</div>
-            </div>
-            <div class="usage-item total">
-              <div class="label">日配额</div>
-              <div class="value">100,000</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="grid" style="margin-top:16px">
-        <div class="card">
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <div><h2 style="margin:0">Workers 列表</h2><div class="small">查看和管理您的 Cloudflare Workers</div></div>
-            <div></div>
-          </div>
-          <div class="workers-list" id="workersList"></div>
-        </div>
-      </div>
+      <div class="grid" style="margin-top:16px"><div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><div><h2 style="margin:0">Workers 列表</h2><div class="small">查看和管理您的 Cloudflare Workers</div></div></div><div class="workers-list" id="workersList"></div></div></div>
     </div>
-    
-    <!-- Batch Page -->
-    <div id="batch-page" class="page-content">
-        <div class="header"><div style="font-size:20px;font-weight:700">批量创建 Workers</div></div>
-        <div class="batch-layout">
-            <div class="batch-sidebar">
-                <div style="padding-bottom:10px;border-bottom:1px solid #eef2f6;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
-                    <span style="font-weight:600">选择账号</span>
-                    <label style="font-size:12px;cursor:pointer"><input type="checkbox" id="selectAllAccounts" onchange="toggleSelectAllAccounts(this)"> 全选</label>
-                </div>
-                <div id="batchAccountList"></div>
-            </div>
-            <div class="batch-main">
-                <div class="card">
-                    <div style="font-weight:600;margin-bottom:12px">基本配置</div>
-                    <label class="small">Worker 名称</label>
-                    <input id="batchWorkerName" class="input" placeholder="例如: my-proxy-worker">
-                    <div style="margin-top:12px">
-                       <label class="small" style="display:flex;align-items:center;cursor:pointer">
-                          <input type="checkbox" id="batchEnableSubdomain" checked style="margin-right:8px"> 开启默认域名 (*.workers.dev)
-                       </label>
-                    </div>
-                    <label class="small" style="display:block;margin-top:12px">代码来源</label>
-                    <select id="batchScriptSourceType" class="input" onchange="toggleBatchSourceInput()">
-                        <option value="builtin">内置模板 (环境变量配置)</option>
-                        <option value="url">自定义链接 (URL)</option>
-                    </select>
-                    <div id="batchSourceBuiltinDiv" style="margin-top:8px">
-                        <select id="batchBuiltinSelect" class="input">
-                            <option value="">未配置 BATCH_NAMES / BATCH_URLS 环境变量</option>
-                        </select>
-                    </div>
-                    <div id="batchSourceUrlDiv" style="margin-top:8px;display:none">
-                        <input id="batchScriptUrl" class="input" placeholder="https://raw.githubusercontent.com/user/repo/main/worker.js">
-                        <div class="note" style="font-size:12px;color:#666;margin-top:4px">注意：链接必须返回纯文本 JS 代码</div>
-                    </div>
-                </div>
-                <div class="card" style="margin-top:16px">
-                    <div style="font-weight:600;margin-bottom:12px">高级绑定配置 (可选)</div>
-                    <div style="margin-bottom:16px">
-                        <div style="font-size:13px;font-weight:600;margin-bottom:4px;color:#374151">环境变量 (ENV)</div>
-                        <div id="batchEnvList"></div>
-                        <button class="btn small" style="margin-top:6px" onclick="addBatchEnvRow()">+ 添加变量</button>
-                    </div>
-                    <div style="margin-bottom:16px;border-top:1px solid #eee;padding-top:10px">
-                        <div style="font-size:13px;font-weight:600;margin-bottom:4px;color:#374151">KV 命名空间 (自动查找或创建)</div>
-                        <div style="display:flex;gap:8px">
-                            <input id="batchKvBind" class="input" placeholder="绑定变量名 (如 MY_KV)">
-                            <input id="batchKvName" class="input" placeholder="KV 空间名称 (如 my-store)">
-                        </div>
-                    </div>
-                    <div style="margin-bottom:16px;border-top:1px solid #eee;padding-top:10px">
-                        <div style="font-size:13px;font-weight:600;margin-bottom:4px;color:#374151">D1 数据库 (自动查找或创建)</div>
-                        <div style="display:flex;gap:8px">
-                            <input id="batchD1Bind" class="input" placeholder="绑定变量名 (如 DB)">
-                            <input id="batchD1Name" class="input" placeholder="数据库名称 (如 my-db)">
-                        </div>
-                    </div>
-                    <button class="btn primary" style="margin-top:10px;width:100%" onclick="startBatchCreate()">开始批量创建</button>
-                </div>
-                <div style="font-weight:600;margin-top:16px">执行日志</div>
-                <div id="batchLog" class="log-area">等待开始...</div>
-            </div>
-        </div>
-    </div>
-
-    <!-- KV Page -->
-    <div id="kv-page" class="page-content">
-      <div class="header">
-        <div style="font-size:20px;font-weight:700">Workers KV 管理</div>
-        <div>
-          <button class="btn primary" onclick="openCreateKVNamespace()">创建 KV 命名空间</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3 style="margin:0">KV 命名空间列表</h3>
-        <div class="small" style="margin-top:8px">管理您的 Workers KV 命名空间</div>
-        <div id="kvNamespacesList" style="margin-top:16px"></div>
-      </div>
-    </div>
-
-    <!-- D1 Page -->
-    <div id="d1-page" class="page-content">
-      <div class="header">
-        <div style="font-size:20px;font-weight:700">D1 数据库管理</div>
-        <div>
-          <button class="btn primary" onclick="openCreateD1Database()">创建 D1 数据库</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3 style="margin:0">D1 SQL 数据库</h3>
-        <div class="small" style="margin-top:8px">管理您的 Cloudflare D1 数据库实例</div>
-        <div id="d1DatabasesList" style="margin-top:16px"></div>
-      </div>
-
-      <div class="card" style="margin-top:16px">
-        <h4 style="margin:0">SQL 控制台</h4>
-        <div class="small" style="margin-top:8px">在选定的数据库中执行 SQL 查询</div>
-        <div style="margin-top:12px">
-          <select id="d1DatabaseSelect" class="input" onchange="refreshD1Tables()">
-            <option value="">- 选择数据库 -</option>
-          </select>
-        </div>
-        <div class="sql-console">
-          <textarea id="d1Query" placeholder="SELECT * FROM table_name LIMIT 10;"></textarea>
-          <button class="btn primary" style="margin-top:8px" onclick="executeD1Query()">执行查询</button>
-        </div>
-        <div id="d1QueryResults" class="sql-results"></div>
-      </div>
-    </div>
-
-    <!-- DNS Page -->
-    <div id="dns-page" class="page-content">
-      <div class="header">
-        <div style="font-size:20px;font-weight:700">域名管理</div>
-        <div>
-          <button class="btn primary" onclick="openAddZone()">添加新域名</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <h3 style="margin:0">域名列表</h3>
-        <div class="small" style="margin-top:8px">管理您的 Cloudflare 域名</div>
-        <div id="zonesList" style="margin-top:16px"></div>
-      </div>
-
-      <div id="dnsRecordsSection" class="card" style="margin-top:16px;display:none">
-        <div class="zone-header">
-          <div>
-            <h3 style="margin:0" id="selectedZoneName">域名 DNS 记录</h3>
-            <div class="small" id="selectedZoneInfo">管理选定域名的 DNS 记录</div>
-          </div>
-          <div class="zone-actions">
-            <button class="btn primary" onclick="openAddDNSRecord()">添加 DNS 记录</button>
-            <button class="btn" onclick="backToZones()">返回域名列表</button>
-          </div>
-        </div>
-        <div id="dnsRecordsList"></div>
-      </div>
-    </div>
-
-        <!-- Settings Page -->
-    <div id="settings-page" class="page-content">
-      <div class="header">
-        <div style="font-size:20px;font-weight:700">设置</div>
-      </div>
-      <div class="card">
-        <h3 style="margin:0">Workers 域名设置</h3>
-        <div class="small" style="margin-top:8px">设置您的 workers.dev 子域名</div>
-        <div style="margin-top:12px">
-          <input id="subdomainInput" class="input" placeholder="输入子域名">
-          <button class="btn primary" style="margin-top:8px" onclick="saveSubdomain()">保存设置</button>
-        </div>
-        <div class="small" style="margin-top:8px">
-          设置后，您的 Workers 将通过 https://worker-name.your-subdomain.workers.dev 访问
-        </div>
-      </div>
-
-      <!-- 新增：Telegram 反馈加群按钮 -->
-      <div class="card" style="margin-top:16px; display:flex; justify-content:center; padding:24px;">
-        <a href="https://t.me/yifang_chat" target="_blank" style="text-decoration:none; text-align:center; color:#334155;">
-          <div style="
-              width: 60px;
-              height: 60px;
-              background: #229ED9;
-              border-radius: 50%;
-              display: flex;
-              align-items: center;
-              justify-content: center;
-              margin: 0 auto;
-              box-shadow: 0 4px 10px rgba(34, 158, 217, 0.4);
-              transition: transform 0.2s;
-            "
-            onmouseover="this.style.transform='scale(1.05)'" 
-            onmouseout="this.style.transform='scale(1)'">
-            <!-- Telegram Icon SVG -->
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-left:-2px;margin-top:2px;">
-              <line x1="22" y1="2" x2="11" y2="13"></line>
-              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-            </svg>
-          </div>
-          <div style="margin-top:10px; font-weight:600; font-size:14px;">反馈加群</div>
-        </a>
-      </div>
-    </div>
-
-
-<!-- Modals -->
-<div id="accountModal" class="modal"><div class="modal-box small">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-     <h3 style="margin:0">切换账号</h3>
-     <button class="trash-btn" onclick="closeAccountSwitcher()">✕</button>
-  </div>
-  <div id="accountListContainer"></div>
-</div></div>
-
-<div id="envModal" class="modal" style="display:none"><div class="modal-box">
-  <h3>管理环境变量</h3>
-  <div class="label">为 Worker 配置环境变量（文本 / 密钥 / JSON）</div>
-  <div id="envRows" style="margin-top:8px"></div>
-  <div style="display:flex;gap:8px;margin-top:12px">
-    <button class="btn primary" onclick="addEnvRow()">添加变量</button>
-    <button class="btn" onclick="saveEnv()">保存</button>
-    <button class="btn" onclick="closeEnvModal()">取消</button>
-  </div>
-</div></div>
-
-<div id="bindModal" class="modal" style="display:none"><div class="modal-box">
-  <h3>绑定 KV / D1</h3>
-  <div class="label">选择要绑定的资源（下拉自动拉取）</div>
-  <div style="display:flex;gap:8px;margin-top:8px">
-    <select id="bindType" class="input" onchange="refreshBindList()"><option value="kv">KV 命名空间</option><option value="d1">D1 数据库</option></select>
-  </div>
-  <div style="margin-top:8px"><select id="bindSelect" class="input"></select></div>
-  <div style="margin-top:8px"><input id="bindName" class="input" placeholder="绑定名，例如 MY_KV"></div>
-  <div style="display:flex;gap:8px;margin-top:12px">
-    <button class="btn primary" onclick="confirmBind()">确认绑定</button>
-    <button class="btn" onclick="closeBindModal()">取消</button>
-  </div>
-</div></div>
-
-<div id="createModal" class="modal" style="display:none"><div class="modal-box">
-  <h3>新建 / 编辑 Worker</h3>
-  <div class="label">Worker 名称</div><input id="createName" class="input" placeholder="worker-name">
-  <div class="label" style="margin-top:8px">脚本 (.js)</div>
-  <textarea id="createScript" class="input" rows="10">export default {
-  async fetch(request, env, ctx) {
-    return new Response('Hello World');
-  }
-};</textarea>
-  <div style="display:flex;gap:8px;margin-top:12px">
-    <button class="btn primary" onclick="confirmCreate()">保存并部署</button>
-    <button class="btn" onclick="closeCreate()">取消</button>
-  </div>
-</div></div>
-
-<div id="createKVModal" class="modal" style="display:none"><div class="modal-box small">
-  <h3>创建 KV 命名空间</h3>
-  <div class="label">输入命名空间名称</div>
-  <input id="kvNamespaceName" class="input" placeholder="my-kv-namespace">
-  <div style="display:flex;gap:8px;margin-top:12px">
-    <button class="btn primary" onclick="confirmCreateKVNamespace()">创建</button>
-    <button class="btn" onclick="closeCreateKVModal()">取消</button>
-  </div>
-</div></div>
-
-<div id="kvValueModal" class="modal" style="display:none"><div class="modal-box">
-  <h3>添加/更新键值</h3>
-  <div class="label">Key</div>
-  <input id="kvKey" class="input" placeholder="例如：user123">
-  <div class="label" style="margin-top:8px">Value</div>
-  <textarea id="kvValue" class="input" rows="6" placeholder='例如：{"name": "John", "age": 30}'></textarea>
-  <div style="display:flex;gap:8px;margin-top:12px">
-    <button class="btn primary" onclick="confirmKVPut()">保存</button>
-    <button class="btn" onclick="closeKVValueModal()">取消</button>
-  </div>
-</div></div>
-
-<div id="createD1Modal" class="modal" style="display:none"><div class="modal-box small">
-  <h3>创建 D1 数据库</h3>
-  <div class="label">输入数据库名称</div>
-  <input id="d1DatabaseName" class="input" placeholder="my-d1-database">
-  <div class="label" style="margin-top:12px">选择区域 (位置)</div>
-  <select id="d1Location" class="input">
-    <option value="auto">自动 (默认)</option>
-    <option value="wnam">北美西部</option>
-    <option value="enam">北美东部</option>
-    <option value="weur">西欧</option>
-    <option value="eeur">东欧</option>
-    <option value="apac">亚太地区</option>
-    <option value="oc">大洋洲</option>
-  </select>
-  <div style="display:flex;gap:8px;margin-top:12px">
-    <button class="btn primary" onclick="confirmCreateD1Database()">创建</button>
-    <button class="btn" onclick="closeCreateD1Modal()">取消</button>
-  </div>
-</div></div>
-
-<div id="addDomainModal" class="modal" style="display:none"><div class="modal-box small">
-  <h3>绑定自定义域名</h3>
-  <div class="label">输入要绑定的完整域名 (例如: app.example.com)</div>
-  <input id="newDomainInput" class="input" placeholder="app.example.com">
-  <div class="small" style="margin-top:4px">请确保该域名已接入您的 Cloudflare 账号。</div>
-  <div style="display:flex;gap:8px;margin-top:12px">
-    <button class="btn primary" onclick="confirmAddDomain()">绑定</button>
-    <button class="btn" onclick="closeAddDomainModal()">取消</button>
-  </div>
-</div></div>
-
-<div id="addZoneModal" class="modal" style="display:none"><div class="modal-box small">
-  <h3>添加新域名</h3>
-  <div class="label">输入您想要接入 Cloudflare 的域名</div>
-  <input id="zoneName" class="input" placeholder="example.com">
-  <div style="display:flex;gap:8px;margin-top:12px">
-    <button class="btn primary" onclick="confirmAddZone()">添加</button>
-    <button class="btn" onclick="closeAddZoneModal()">取消</button>
-  </div>
-</div></div>
-
-<div id="addDNSRecordModal" class="modal" style="display:none"><div class="modal-box">
-  <h3 id="dnsRecordModalTitle">添加 DNS 记录</h3>
-  <div class="label">记录类型</div>
-  <select id="dnsRecordType" class="input">
-    <option value="A">A</option><option value="AAAA">AAAA</option><option value="CNAME">CNAME</option><option value="MX">MX</option><option value="TXT">TXT</option><option value="NS">NS</option>
-  </select>
-  <div class="label" style="margin-top:8px">记录名称</div>
-  <input id="dnsRecordName" class="input" placeholder="例如：www 或 @">
-  <div class="label" style="margin-top:8px">记录内容</div>
-  <input id="dnsRecordContent" class="input" placeholder="例如：192.0.2.1">
-  <div class="label" style="margin-top:8px">TTL (秒)</div>
-  <select id="dnsRecordTTL" class="input">
-    <option value="1">自动</option><option value="120">2分钟</option><option value="300">5分钟</option><option value="3600">1小时</option><option value="86400">1天</option>
-  </select>
-  <div style="margin-top:8px"><label><input type="checkbox" id="dnsRecordProxied"> 启用代理（橙色云）</label></div>
-  <div style="display:flex;gap:8px;margin-top:12px">
-    <button class="btn primary" id="dnsRecordSubmitBtn" onclick="confirmAddDNSRecord()">添加记录</button>
-    <button class="btn" onclick="closeAddDNSRecordModal()">取消</button>
-  </div>
-</div></div>
-
-<div id="editDNSRecordModal" class="modal" style="display:none"><div class="modal-box">
-  <h3>编辑 DNS 记录</h3>
-  <div class="label">记录类型</div>
-  <select id="editDnsRecordType" class="input">
-    <option value="A">A</option><option value="AAAA">AAAA</option><option value="CNAME">CNAME</option><option value="MX">MX</option><option value="TXT">TXT</option><option value="NS">NS</option>
-  </select>
-  <div class="label" style="margin-top:8px">记录名称</div>
-  <input id="editDnsRecordName" class="input">
-  <div class="label" style="margin-top:8px">记录内容</div>
-  <input id="editDnsRecordContent" class="input">
-  <div class="label" style="margin-top:88px">TTL (秒)</div>
-  <select id="editDnsRecordTTL" class="input">
-    <option value="1">自动</option><option value="120">2分钟</option><option value="300">5分钟</option><option value="3600">1小时</option><option value="86400">1天</option>
-  </select>
-  <div style="margin-top:8px"><label><input type="checkbox" id="editDnsRecordProxied"> 启用代理（橙色云）</label></div>
-  <div style="display:flex;gap:8px;margin-top:12px">
-    <button class="btn primary" onclick="confirmEditDNSRecord()">保存修改</button>
-    <button class="btn" onclick="closeEditDNSRecordModal()">取消</button>
-  </div>
-</div></div>
-
-<div id="outModal" class="modal" style="display:none"><div class="modal-box">
-  <h3>调试输出</h3>
-  <pre id="debugOut" style="height:300px;overflow:auto"></pre>
-  <div style="display:flex;justify-content:flex-end;margin-top:8px"><button class="btn" onclick="closeOut()">关闭</button></div>
-</div></div>
-
+    <div id="batch-page" class="page-content"><div class="header"><div style="font-size:20px;font-weight:700">批量创建 Workers</div></div><div class="batch-layout"><div class="batch-sidebar"><div style="padding-bottom:10px;border-bottom:1px solid #eef2f6;margin-bottom:10px"><span style="font-weight:600">选择账号</span></div><div id="batchAccountList"></div></div><div class="batch-main"><div class="card"><div style="font-weight:600;margin-bottom:12px">基本配置</div><label class="small">Worker 名称</label><input id="batchWorkerName" class="input" placeholder="例如: my-proxy-worker"><div style="margin-top:12px"><label class="small" style="display:flex;align-items:center;cursor:pointer"><input type="checkbox" id="batchEnableSubdomain" checked style="margin-right:8px"> 开启默认域名 (*.workers.dev)</label></div><label class="small" style="display:block;margin-top:12px">代码来源</label><select id="batchScriptSourceType" class="input"><option value="builtin">内置模板</option><option value="url">自定义链接 (URL)</option></select><div id="batchSourceBuiltinDiv" style="margin-top:8px"><select id="batchBuiltinSelect" class="input"><option value="">选择模板</option></select></div><div id="batchSourceUrlDiv" style="margin-top:8px;display:none"><input id="batchScriptUrl" class="input" placeholder="https://raw.githubusercontent.com/user/repo/main/worker.js"></div></div><div class="card" style="margin-top:16px"><div style="font-weight:600;margin-bottom:12px">高级绑定配置</div><div><div style="font-size:13px;font-weight:600;margin-bottom:4px">环境变量</div><div id="batchEnvList"></div><button class="btn small" onclick="addBatchEnvRow()">+ 添加变量</button></div><div style="margin-top:12px"><div style="font-size:13px;font-weight:600;margin-bottom:4px">KV 命名空间</div><div style="display:flex;gap:8px"><input id="batchKvBind" class="input" placeholder="绑定名"><input id="batchKvName" class="input" placeholder="KV 空间名称"></div></div><div style="margin-top:12px"><div style="font-size:13px;font-weight:600;margin-bottom:4px">D1 数据库</div><div style="display:flex;gap:8px"><input id="batchD1Bind" class="input" placeholder="绑定名"><input id="batchD1Name" class="input" placeholder="数据库名称"></div></div><button class="btn primary" style="margin-top:16px;width:100%" onclick="startBatchCreate()">开始批量创建</button></div><div><div style="font-weight:600;margin-top:16px">执行日志</div><div id="batchLog" class="log-area">等待开始...</div></div></div></div></div>
+    <div id="kv-page" class="page-content"><div class="header"><div style="font-size:20px;font-weight:700">Workers KV 管理</div><div><button class="btn primary" onclick="openCreateKVNamespace()">创建 KV 命名空间</button></div></div><div class="card"><h3 style="margin:0">KV 命名空间列表</h3><div id="kvNamespacesList" style="margin-top:16px"></div></div></div>
+    <div id="d1-page" class="page-content"><div class="header"><div style="font-size:20px;font-weight:700">D1 数据库管理</div><div><button class="btn primary" onclick="openCreateD1Database()">创建 D1 数据库</button></div></div><div class="card"><h3 style="margin:0">D1 SQL 数据库</h3><div id="d1DatabasesList" style="margin-top:16px"></div></div><div class="card" style="margin-top:16px"><h4 style="margin:0">SQL 控制台</h4><div style="margin-top:12px"><select id="d1DatabaseSelect" class="input"><option value="">- 选择数据库 -</option></select></div><div class="sql-console"><textarea id="d1Query" placeholder="SELECT * FROM table_name LIMIT 10;"></textarea><button class="btn primary" style="margin-top:8px" onclick="executeD1Query()">执行查询</button></div><div id="d1QueryResults" class="sql-results"></div></div></div>
+    <div id="dns-page" class="page-content"><div class="header"><div style="font-size:20px;font-weight:700">域名管理</div><div><button class="btn primary" onclick="openAddZone()">添加新域名</button></div></div><div class="card"><h3 style="margin:0">域名列表</h3><div id="zonesList" style="margin-top:16px"></div></div><div id="dnsRecordsSection" class="card" style="margin-top:16px;display:none"><div class="zone-header"><div><h3 style="margin:0" id="selectedZoneName">域名 DNS 记录</h3><div class="small" id="selectedZoneInfo"></div></div><div class="zone-actions"><button class="btn primary" onclick="openAddDNSRecord()">添加 DNS 记录</button><button class="btn" onclick="backToZones()">返回域名列表</button></div></div><div id="dnsRecordsList"></div></div></div>
+    <div id="settings-page" class="page-content"><div class="header"><div style="font-size:20px;font-weight:700">设置</div></div><div class="card"><h3 style="margin:0">Workers 域名设置</h3><div class="small" style="margin-top:8px">设置您的 workers.dev 子域名</div><div style="margin-top:12px"><input id="subdomainInput" class="input" placeholder="输入子域名"><button class="btn primary" style="margin-top:8px" onclick="saveSubdomain()">保存设置</button></div></div><div class="card" style="margin-top:16px; display:flex; justify-content:center; padding:24px;"><a href="https://t.me/yifang_chat" target="_blank" style="text-decoration:none; text-align:center; color:#334155;"><div style="width:60px;height:60px;background:#229ED9;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto;box-shadow:0 4px 10px rgba(34,158,217,0.4)"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg></div><div style="margin-top:10px;font-weight:600;font-size:14px;">反馈加群</div></a></div></div>
+  </main>
+</div>
+<div id="accountModal" class="modal"><div class="modal-box small"><div style="display:flex;justify-content:space-between;margin-bottom:16px"><h3 style="margin:0">切换账号</h3><button onclick="closeAccountSwitcher()">✕</button></div><div id="accountListContainer"></div></div></div>
+<div id="envModal" class="modal"><div class="modal-box"><h3>管理环境变量</h3><div id="envRows"></div><div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" onclick="addEnvRow()">添加变量</button><button class="btn" onclick="saveEnv()">保存</button><button class="btn" onclick="closeEnvModal()">取消</button></div></div></div>
+<div id="bindModal" class="modal"><div class="modal-box"><h3>绑定 KV / D1</h3><div style="display:flex;gap:8px;margin-top:8px"><select id="bindType" class="input"><option value="kv">KV 命名空间</option><option value="d1">D1 数据库</option></select></div><div style="margin-top:8px"><select id="bindSelect" class="input"></select></div><div style="margin-top:8px"><input id="bindName" class="input" placeholder="绑定名"></div><div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" onclick="confirmBind()">确认绑定</button><button class="btn" onclick="closeBindModal()">取消</button></div></div></div>
+<div id="createModal" class="modal"><div class="modal-box"><h3>新建 / 编辑 Worker</h3><input id="createName" class="input" placeholder="worker-name"><textarea id="createScript" class="input" rows="10">export default { async fetch(request, env, ctx) { return new Response('Hello World'); } };</textarea><div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" onclick="confirmCreate()">保存并部署</button><button class="btn" onclick="closeCreate()">取消</button></div></div></div>
+<div id="createKVModal" class="modal"><div class="modal-box small"><h3>创建 KV 命名空间</h3><input id="kvNamespaceName" class="input" placeholder="my-kv-namespace"><div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" onclick="confirmCreateKVNamespace()">创建</button><button class="btn" onclick="closeCreateKVModal()">取消</button></div></div></div>
+<div id="kvValueModal" class="modal"><div class="modal-box"><h3>添加/更新键值</h3><input id="kvKey" class="input" placeholder="Key"><textarea id="kvValue" class="input" rows="6" placeholder="Value"></textarea><div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" onclick="confirmKVPut()">保存</button><button class="btn" onclick="closeKVValueModal()">取消</button></div></div></div>
+<div id="createD1Modal" class="modal"><div class="modal-box small"><h3>创建 D1 数据库</h3><input id="d1DatabaseName" class="input" placeholder="my-d1-database"><div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" onclick="confirmCreateD1Database()">创建</button><button class="btn" onclick="closeCreateD1Modal()">取消</button></div></div></div>
+<div id="addDomainModal" class="modal"><div class="modal-box small"><h3>绑定自定义域名</h3><input id="newDomainInput" class="input" placeholder="app.example.com"><div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" onclick="confirmAddDomain()">绑定</button><button class="btn" onclick="closeAddDomainModal()">取消</button></div></div></div>
+<div id="addZoneModal" class="modal"><div class="modal-box small"><h3>添加新域名</h3><input id="zoneName" class="input" placeholder="example.com"><div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" onclick="confirmAddZone()">添加</button><button class="btn" onclick="closeAddZoneModal()">取消</button></div></div></div>
+<div id="addDNSRecordModal" class="modal"><div class="modal-box"><h3>添加 DNS 记录</h3><select id="dnsRecordType" class="input"><option value="A">A</option><option value="AAAA">AAAA</option><option value="CNAME">CNAME</option><option value="MX">MX</option><option value="TXT">TXT</option></select><input id="dnsRecordName" class="input" placeholder="记录名称"><input id="dnsRecordContent" class="input" placeholder="记录内容"><select id="dnsRecordTTL" class="input"><option value="1">自动</option><option value="120">2分钟</option><option value="300">5分钟</option><option value="3600">1小时</option><option value="86400">1天</option></select><label><input type="checkbox" id="dnsRecordProxied"> 启用代理</label><div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" onclick="confirmAddDNSRecord()">添加记录</button><button class="btn" onclick="closeAddDNSRecordModal()">取消</button></div></div></div>
+<div id="editDNSRecordModal" class="modal"><div class="modal-box"><h3>编辑 DNS 记录</h3><select id="editDnsRecordType" class="input"><option value="A">A</option><option value="AAAA">AAAA</option><option value="CNAME">CNAME</option><option value="MX">MX</option><option value="TXT">TXT</option></select><input id="editDnsRecordName" class="input"><input id="editDnsRecordContent" class="input"><select id="editDnsRecordTTL" class="input"><option value="1">自动</option><option value="120">2分钟</option><option value="300">5分钟</option><option value="3600">1小时</option><option value="86400">1天</option></select><label><input type="checkbox" id="editDnsRecordProxied"> 启用代理</label><div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" onclick="confirmEditDNSRecord()">保存</button><button class="btn" onclick="closeEditDNSRecordModal()">取消</button></div></div></div>
+<div id="outModal" class="modal"><div class="modal-box"><h3>调试输出</h3><pre id="debugOut" style="height:300px;overflow:auto"></pre><button class="btn" onclick="closeOut()">关闭</button></div></div>
 <script src="/static.js"></script>
 </body>
 </html>`;
 }
 
-// ---------------- Static JS ----------------
-function renderStaticJS(env) {
-  let safeUrls = "[]";
-  let safeNames = "[]";
-
-  try {
-      if (env && typeof env === 'object') {
-          if (env.BATCH_URLS) safeUrls = typeof env.BATCH_URLS === 'string' ? env.BATCH_URLS : JSON.stringify(env.BATCH_URLS);
-          if (env.BATCH_NAMES) safeNames = typeof env.BATCH_NAMES === 'string' ? env.BATCH_NAMES : JSON.stringify(env.BATCH_NAMES);
-      } else {
-          if (typeof BATCH_URLS !== 'undefined') safeUrls = typeof BATCH_URLS === 'string' ? BATCH_URLS : JSON.stringify(BATCH_URLS);
-          if (typeof BATCH_NAMES !== 'undefined') safeNames = typeof BATCH_NAMES === 'string' ? BATCH_NAMES : JSON.stringify(BATCH_NAMES);
-      }
-  } catch(e) {}
-
-  if (!safeUrls.trim().startsWith('[')) safeUrls = "[]";
-  if (!safeNames.trim().startsWith('[')) safeNames = "[]";
-
-  return `(function(){
-  function el(id){ return document.getElementById(id); }
-  function safeParse(s){ try { return JSON.parse(s); } catch(e){ return null; } }
-  function getActiveCreds(){ return { email: localStorage.getItem('cf_active_email')||'', key: localStorage.getItem('cf_active_key')||'' }; }
-  
-  function loadSaved(){ try { return JSON.parse(localStorage.getItem('cf_accounts')||'[]'); } catch(e){ return []; } }
-  function saveAccounts(arr){ localStorage.setItem('cf_accounts', JSON.stringify(arr)); }
-
-  const BATCH_CONFIG = {
-    urls: ${safeUrls},
-    names: ${safeNames}
-  };
-
+function renderStaticJS() {
   const DEFAULT_WORKER_SCRIPT = "export default {\\n  async fetch(request, env, ctx) {\\n    return new Response('Hello World');\\n  }\\n};";
-
-  function showNotification(message, type = 'success') {
-    const notification = document.createElement('div');
-    notification.innerHTML = message;
-    notification.style.cssText = \`
-      position: fixed;
-      top: 20px;
-      right: 20px;
-      padding: 12px 20px;
-      border-radius: 8px;
-      color: white;
-      background: \${type === 'success' ? '#10b981' : '#ef4444'};
-      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-      z-index: 10000;
-      max-width: 400px;
-      animation: slideIn 0.3s ease-out;
-    \`;
-    document.body.appendChild(notification);
-    setTimeout(() => {
-      notification.style.animation = 'slideOut 0.3s ease-in';
-      setTimeout(() => notification.remove(), 300);
-    }, 3000);
-    
-    if (!document.querySelector('#notification-styles')) {
-      const style = document.createElement('style');
-      style.id = 'notification-styles';
-      style.textContent = \`
-        @keyframes slideIn {
-          from { transform: translateX(100%); opacity: 0; }
-          to { transform: translateX(0); opacity: 1; }
-        }
-        @keyframes slideOut {
-          from { transform: translateX(0); opacity: 1; }
-          to { transform: translateX(100%); opacity: 0; }
-        }
-      \`;
-      document.head.appendChild(style);
-    }
-  }
-
-  function copyToClipboard(text, event) {
-    if (event) event.stopPropagation();
-    navigator.clipboard.writeText(text).then(() => {
-      showNotification('已复制到剪贴板');
-    }).catch(err => {
-      console.error('复制失败:', err);
-      showNotification('复制失败', 'error');
-    });
-  }
-
-  async function api(action, body) {
-    const c = getActiveCreds();
-    const payload = Object.assign({ action }, c, body);
-    const r = await fetch('/api', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-    try { return await r.json(); } catch (e) { return await r.text(); }
-  }
-
-  const page = document.body && document.body.dataset && document.body.dataset.page;
   
-  if (page === 'login') {
-    function renderSaved(){
-      const cont = el('savedAccounts'); const arr = loadSaved();
-      cont.innerHTML = '';
-      if (!arr.length) { cont.textContent = '未找到已保存账号'; return; }
-      arr.forEach((a, idx) => {
-        const d = document.createElement('div');
-        d.className = 'account-row';
-        d.innerHTML = '<div><div style="font-weight:600">'+a.email+'</div><div class="small">添加于 '+(a.added||'')+'</div></div><div><button class="btn" data-idx="'+idx+'">快速登录</button></div>';
-        cont.appendChild(d);
-      });
-      Array.from(cont.querySelectorAll('button')).forEach(btn => {
-        btn.addEventListener('click', function(){ const idx = +this.dataset.idx; const arr = loadSaved(); if (!arr[idx]) return alert('账号不存在'); localStorage.setItem('cf_active_email', arr[idx].email); localStorage.setItem('cf_active_key', arr[idx].key); location.href='/workers'; });
-      });
-    }
+  return `// Cloudflare Manager Static JS
+const DEFAULT_WORKER_SCRIPT = "export default { async fetch(request, env, ctx) { return new Response('Hello World'); } };";
 
-    document.getElementById('verifyBtn').addEventListener('click', async function(){
-      const email = el('newEmail').value.trim(); 
-      const key = el('newKey').value.trim();
-      if (!email || !key) return alert('请输入邮箱和 API Key');
-      
-      const r = await fetch('/api', { 
-        method:'POST', 
-        headers:{'Content-Type':'application/json'}, 
-        body: JSON.stringify({ action:'validate-credentials', email, key }) 
-      });
-      let res;
-      try { res = await r.json(); } catch(e) { res = await r.text(); }
-      
-      if (res && (res.result || (res.success===true))) {
-        const arr = loadSaved();
-        const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }).replace(/\\//g, '-');
-        const existIdx = arr.findIndex(x => x.email === email);
-        if (existIdx !== -1) arr.splice(existIdx, 1);
-        arr.unshift({ email, key, added: now });
-        saveAccounts(arr);
-        localStorage.setItem('cf_active_email', email);
-        localStorage.setItem('cf_active_key', key);
-        location.href = '/workers';
-      } else {
-        alert('验证失败：' + (res && (res.errors||res.message||res.error) || 'unknown'));
-      }
-    });
+let currentWorkerForEnv = '';
+let currentWorkerForBind = '';
+let currentZoneId = null;
 
-    document.getElementById('openBatchModalBtn').addEventListener('click', function(){ el('batchLoginModal').style.display='flex'; });
-    document.getElementById('confirmBatchLogin').addEventListener('click', function(){
-       const raw = el('batchLoginInput').value;
-       if (!raw.trim()) return alert('请输入内容');
-       const lines = raw.split('\\n');
-       const newAccs = [];
-       const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }).replace(/\\//g, '-');
-       lines.forEach(line => {
-           const parts = line.split('|');
-           if (parts.length >= 2) {
-               const email = parts[0].trim(); const key = parts[1].trim();
-               if (email && key) newAccs.push({ email, key, added: now });
-           }
-       });
-       if (newAccs.length > 0) {
-           const current = loadSaved();
-           newAccs.forEach(acc => {
-               const idx = current.findIndex(c => c.email === acc.email);
-               if (idx !== -1) current[idx] = acc; else current.unshift(acc);
-           });
-           saveAccounts(current); renderSaved(); el('batchLoginModal').style.display='none'; el('batchLoginInput').value = ''; showNotification(\`已导入 \${newAccs.length} 个账号\`);
-       } else { alert('未解析到有效账号，请检查格式'); }
+function getSessionToken() { return localStorage.getItem('cf_session_token'); }
+
+async function api(action, body) {
+  const sessionToken = getSessionToken();
+  const payload = Object.assign({ action, sessionToken }, body);
+  const r = await fetch('/api', { 
+    method: 'POST', 
+    headers: { 'Content-Type': 'application/json' }, 
+    body: JSON.stringify(payload) 
+  });
+  try { return await r.json(); } 
+  catch (e) { return { success: false, error: e.message }; }
+}
+
+async function logout() {
+  await api('logout', { sessionToken: getSessionToken() });
+  localStorage.removeItem('cf_session_token');
+  window.location.href = '/login';
+}
+
+function showNotification(message, type) {
+  const notification = document.createElement('div');
+  notification.textContent = message;
+  notification.style.cssText = \`
+    position: fixed; top: 20px; right: 20px; padding: 12px 20px; border-radius: 8px;
+    color: white; background: \${type === 'error' ? '#ef4444' : '#10b981'};
+    z-index: 10000; animation: fadeInOut 3s ease;
+  \`;
+  document.body.appendChild(notification);
+  setTimeout(() => notification.remove(), 3000);
+}
+
+function navTo(page) {
+  document.querySelectorAll('.nav .item').forEach(i => i.classList.remove('active'));
+  document.querySelectorAll('.page-content').forEach(p => p.classList.remove('active'));
+  const target = document.getElementById(page + '-page');
+  const navItem = Array.from(document.querySelectorAll('.nav .item')).find(i => i.dataset.page === page);
+  if (navItem) navItem.classList.add('active');
+  if (target) target.classList.add('active');
+  
+  if (page === 'workers') refreshWorkers();
+  if (page === 'kv') refreshKVNamespaces();
+  if (page === 'd1') refreshD1Databases();
+  if (page === 'dns') refreshZones();
+}
+
+function openCreateWorker() {
+  document.getElementById('createName').value = '';
+  document.getElementById('createScript').value = DEFAULT_WORKER_SCRIPT;
+  document.getElementById('createModal').style.display = 'flex';
+}
+
+function closeCreate() { document.getElementById('createModal').style.display = 'none'; }
+
+async function confirmCreate() {
+  const name = document.getElementById('createName').value.trim();
+  const script = document.getElementById('createScript').value;
+  if (!name) return showNotification('请输入 Worker 名称', 'error');
+  const res = await api('deploy-worker', { scriptName: name, scriptSource: script, metadataBindings: [] });
+  if (res && res.success) {
+    showNotification('Worker 部署成功');
+    closeCreate();
+    refreshWorkers();
+  } else {
+    showNotification(res.error || '部署失败', 'error');
+  }
+}
+
+async function refreshWorkers() {
+  const listDiv = document.getElementById('workersList');
+  if (!listDiv) return;
+  listDiv.innerHTML = '加载中...';
+  const accounts = await api('list-accounts');
+  if (!accounts || !accounts.result) { listDiv.innerHTML = '无法获取账户'; return; }
+  const accountId = accounts.result[0].id;
+  localStorage.setItem('cf_accountId', accountId);
+  const res = await api('list-workers', { accountId });
+  if (!res || !res.result) { listDiv.innerHTML = '获取 Workers 失败'; return; }
+  
+  listDiv.innerHTML = '';
+  for (const w of res.result) {
+    const name = w.id || w.name;
+    const created = w.created_on || '';
+    const subdomainEnabled = w.subdomainEnabled !== false;
+    const div = document.createElement('div');
+    div.className = 'worker-row';
+    div.innerHTML = \`
+      <div class="worker-info">
+        <div style="font-weight:700">\${name}</div>
+        <div class="worker-meta">创建时间：\${created}</div>
+        \${w.defaultDomain ? '<div class="worker-domains"><div class="small">默认域名: <a href="https://' + w.defaultDomain.hostname + '" target="_blank">' + w.defaultDomain.hostname + '</a></div></div>' : ''}
+      </div>
+      <div class="worker-right">
+        <div class="btns">
+          <button class="btn" data-name="\${name}" data-act="edit">编辑</button>
+          <button class="btn danger" data-name="\${name}" data-act="delete">删除</button>
+        </div>
+      </div>
+    \`;
+    listDiv.appendChild(div);
+  }
+  
+  document.querySelectorAll('.btns .btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const act = btn.dataset.act;
+      const name = btn.dataset.name;
+      if (act === 'edit') editWorker(name);
+      if (act === 'delete') deleteWorker(name);
     });
-    document.getElementById('clearBtn').addEventListener('click', function(){ if(confirm('清除保存的账号？')){ localStorage.removeItem('cf_accounts'); renderSaved(); } });
-    renderSaved();
+  });
+}
+
+async function editWorker(name) {
+  const accounts = await api('list-accounts');
+  const accountId = accounts.result?.[0]?.id;
+  const res = await api('get-worker-script', { accountId, scriptName: name });
+  if (res && res.rawScript) {
+    document.getElementById('createName').value = name;
+    document.getElementById('createScript').value = res.rawScript;
+    document.getElementById('createModal').style.display = 'flex';
+  } else {
+    showNotification('获取 Worker 脚本失败', 'error');
+  }
+}
+
+async function deleteWorker(name) {
+  if (!confirm('确定要删除 ' + name + ' 吗？')) return;
+  const accounts = await api('list-accounts');
+  const accountId = accounts.result?.[0]?.id;
+  const res = await api('delete-worker', { accountId, scriptName: name });
+  if (res && res.success) {
+    showNotification('Worker 删除成功');
+    refreshWorkers();
+  } else {
+    showNotification(res.error || '删除失败', 'error');
+  }
+}
+
+async function refreshKVNamespaces() {
+  const listDiv = document.getElementById('kvNamespacesList');
+  if (!listDiv) return;
+  const accountId = localStorage.getItem('cf_accountId');
+  if (!accountId) { listDiv.innerHTML = '请先加载 Workers 页面'; return; }
+  const res = await api('list-kv-namespaces', { accountId });
+  const namespaces = res.result || [];
+  listDiv.innerHTML = '';
+  if (namespaces.length === 0) {
+    listDiv.innerHTML = '<div>暂无 KV 命名空间</div>';
     return;
   }
-
-  if (page === 'app') {
-    function escapeHtml(s){ return s ? s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;') : ''; }
-    function debugOut(v){ el('debugOut').textContent = typeof v === 'string' ? v : JSON.stringify(v,null,2); el('outModal').style.display='flex'; }
-
-    (function initBatchDropdown() {
-        if (!el('batchBuiltinSelect')) return;
-        const sel = el('batchBuiltinSelect');
-        sel.innerHTML = '';
-        if (BATCH_CONFIG.names && BATCH_CONFIG.names.length > 0) {
-            BATCH_CONFIG.names.forEach((name, idx) => {
-                const opt = document.createElement('option'); opt.value = idx; opt.textContent = name; sel.appendChild(opt);
-            });
-        } else { sel.innerHTML = '<option value="">未在环境变量配置 BATCH_NAMES</option>'; }
-    })();
-
-    function openAccountSwitcher() {
-      const arr = loadSaved(); const current = getActiveCreds(); const cont = el('accountListContainer'); cont.innerHTML = '';
-      if (arr.length === 0) { cont.innerHTML = '<div style="padding:16px;text-align:center;color:#64748b">暂无其他账号</div>'; } else {
-        arr.forEach((acc, idx) => {
-          const isActive = acc.email === current.email; const div = document.createElement('div'); div.className = 'acct-row ' + (isActive ? 'acct-active' : '');
-          div.innerHTML = \`<div style="flex:1;cursor:pointer" onclick="switchAccount(\${idx})"><div style="font-weight:600;display:flex;align-items:center">\${escapeHtml(acc.email)}\${isActive ? '<span class="badge">当前</span>' : ''}</div><div class="small" style="margin-bottom:0">\${acc.added || ''}</div></div>\${!isActive ? \`<button class="trash-btn" onclick="removeAccount(\${idx})" title="移除账号">✕</button>\` : ''}\`; cont.appendChild(div);
-        });
-      }
-      el('accountModal').style.display = 'flex';
-    }
-    function switchAccount(idx) { const arr = loadSaved(); if (arr[idx]) { localStorage.setItem('cf_active_email', arr[idx].email); localStorage.setItem('cf_active_key', arr[idx].key); localStorage.removeItem('cf_accountId'); showNotification('正在切换账号...'); setTimeout(() => location.reload(), 500); } }
-    function removeAccount(idx) { if(!confirm('确定要移除此账号吗？')) return; const arr = loadSaved(); arr.splice(idx, 1); saveAccounts(arr); openAccountSwitcher(); }
-    function closeAccountSwitcher() { el('accountModal').style.display = 'none'; }
-
-    function navTo(page) {
-      document.querySelectorAll('.nav .item').forEach(i => i.classList.remove('active'));
-      document.querySelectorAll('.page-content').forEach(p => p.classList.remove('active'));
-      const activeNav = Array.from(document.querySelectorAll('.nav .item')).find(i => i.dataset.page === page);
-      const activePage = el(page + '-page');
-      if (activeNav) activeNav.classList.add('active'); if (activePage) activePage.classList.add('active');
-      switch(page) {
-        case 'workers': refreshWorkers(); break;
-        case 'batch': renderBatchPage(); break;
-        case 'kv': refreshKVNamespaces(); break;
-        case 'd1': refreshD1Databases(); break;
-        case 'dns': showZonesList(); break;
-        case 'settings': loadSubdomainSettings(); break;
-      }
-    }
-
-    function renderBatchPage() {
-        const arr = loadSaved(); const list = el('batchAccountList'); list.innerHTML = '';
-        if (arr.length === 0) { list.innerHTML = '<div style="padding:10px;color:#999">请先在登录页添加账号</div>'; return; }
-        arr.forEach((acc, idx) => {
-            const div = document.createElement('div'); div.className = 'account-check-item';
-            div.innerHTML = \`<label style="flex:1;cursor:pointer;display:flex;align-items:center"><input type="checkbox" class="batch-acc-chk" value="\${idx}" style="margin-right:8px"><span style="font-size:13px">\${escapeHtml(acc.email)}</span></label>\`; list.appendChild(div);
-        });
-        el('batchEnvList').innerHTML = ''; 
-    }
-    window.toggleSelectAllAccounts = function(checkbox) { document.querySelectorAll('.batch-acc-chk').forEach(c => c.checked = checkbox.checked); };
-    window.toggleBatchSourceInput = function() { const type = el('batchScriptSourceType').value; if (type === 'url') { el('batchSourceBuiltinDiv').style.display = 'none'; el('batchSourceUrlDiv').style.display = 'block'; } else { el('batchSourceBuiltinDiv').style.display = 'block'; el('batchSourceUrlDiv').style.display = 'none'; } };
-    function appendBatchLog(msg, color='#fff') { const log = el('batchLog'); const span = document.createElement('div'); span.style.color = color; span.textContent = \`[\${new Date().toLocaleTimeString()}] \${msg}\`; log.appendChild(span); log.scrollTop = log.scrollHeight; }
-    
-    window.addBatchEnvRow = function() {
-        const div = document.createElement('div'); div.className='env-row-batch';
-        div.innerHTML = \`<input class="input b-env-key" placeholder="Key" style="flex:1"><input class="input b-env-val" placeholder="Value" style="flex:1"><button class="trash-btn" onclick="this.parentElement.remove()">✕</button>\`;
-        el('batchEnvList').appendChild(div);
-    };
-
-    async function startBatchCreate() {
-        const name = el('batchWorkerName').value.trim();
-        if (!name) return alert('请输入 Worker 名称');
-        const chks = Array.from(document.querySelectorAll('.batch-acc-chk:checked'));
-        if (chks.length === 0) return alert('请至少选择一个账号');
-
-        const enableSubdomain = el('batchEnableSubdomain').checked;
-
-        const sourceType = el('batchScriptSourceType').value;
-        let scriptUrl = '';
-        if (sourceType === 'builtin') {
-            const idx = el('batchBuiltinSelect').value;
-            if (idx === '' || !BATCH_CONFIG.urls[idx]) return alert('请选择有效的模板或检查环境变量配置');
-            scriptUrl = BATCH_CONFIG.urls[idx];
-        } else {
-            scriptUrl = el('batchScriptUrl').value.trim();
-            if (!scriptUrl) return alert('请输入脚本链接');
-        }
-
-        const bindings = [];
-        el('batchEnvList').querySelectorAll('.env-row-batch').forEach(row => {
-            const k = row.querySelector('.b-env-key').value.trim();
-            const v = row.querySelector('.b-env-val').value;
-            if (k) bindings.push({ type: 'plain_text', name: k, text: v });
-        });
-        
-        const kvBind = el('batchKvBind').value.trim();
-        const kvName = el('batchKvName').value.trim();
-        const useKv = kvBind && kvName;
-
-        const d1Bind = el('batchD1Bind').value.trim();
-        const d1Name = el('batchD1Name').value.trim();
-        const useD1 = d1Bind && d1Name;
-
-        let scriptContent = '';
-        appendBatchLog('正在获取远程脚本: ' + scriptUrl, '#60a5fa');
-        try {
-            const res = await api('fetch-external-script', { url: scriptUrl });
-            if (res.success) { scriptContent = res.content; appendBatchLog('脚本获取成功', '#4ade80'); } 
-            else { appendBatchLog('脚本获取失败: ' + res.error, '#ef4444'); return; }
-        } catch (e) { appendBatchLog('脚本获取异常: ' + e.message, '#ef4444'); return; }
-
-        if (!scriptContent) return alert('脚本内容为空');
-
-        const accounts = loadSaved();
-        el('batchLog').innerHTML = ''; 
-        appendBatchLog(\`开始批量部署，共选中 \${chks.length} 个账号\`, '#fcd34d');
-
-        for (const chk of chks) {
-            const idx = parseInt(chk.value);
-            const acc = accounts[idx];
-            if (!acc) continue;
-            
-            const creds = { email: acc.email, key: acc.key };
-
-            appendBatchLog(\`正在处理账号: \${acc.email} ...\`);
-            
-            try {
-                const accRes = await api('list-accounts', creds);
-                if (!accRes.success || !accRes.result || !accRes.result.length) {
-                    appendBatchLog(\`❌ \${acc.email}: 获取账户ID失败\`, '#ef4444'); continue;
-                }
-                const accountId = accRes.result[0].id;
-                creds.accountId = accountId;
-
-                const localBindings = [...bindings];
-
-                if (useKv) {
-                    appendBatchLog(\`   ↳ 检查 KV: \${kvName}\`, '#9ca3af');
-                    const kvList = await api('list-kv-namespaces', creds);
-                    let targetKv = kvList.result ? kvList.result.find(k => k.title === kvName) : null;
-                    
-                    if (!targetKv) {
-                        appendBatchLog(\`   ↳ 创建 KV: \${kvName}\`, '#fbbf24');
-                        const createKv = await api('create-kv-namespace', { ...creds, title: kvName });
-                        if (createKv.success && createKv.result) targetKv = createKv.result;
-                        else appendBatchLog(\`   ⚠️ KV创建失败: \${createKv.error}\`, '#ef4444');
-                    }
-                    
-                    if (targetKv) {
-                        localBindings.push({ type: 'kv_namespace', name: kvBind, namespace_id: targetKv.id });
-                    }
-                }
-
-                if (useD1) {
-                    appendBatchLog(\`   ↳ 检查 D1: \${d1Name}\`, '#9ca3af');
-                    const d1List = await api('list-d1', creds);
-                    let targetD1 = d1List.result ? d1List.result.find(d => d.name === d1Name) : null;
-                    
-                    if (!targetD1) {
-                        appendBatchLog(\`   ↳ 创建 D1: \${d1Name}\`, '#fbbf24');
-                        const createD1 = await api('create-d1-database', { ...creds, name: d1Name });
-                        if (createD1.success && createD1.result) targetD1 = createD1.result;
-                        else appendBatchLog(\`   ⚠️ D1创建失败: \${createD1.error}\`, '#ef4444');
-                    }
-                    
-                    if (targetD1) {
-                        localBindings.push({ type: 'd1', name: d1Bind, id: targetD1.uuid || targetD1.id });
-                    }
-                }
-
-                const deployRes = await api('deploy-worker', { 
-                    ...creds,
-                    scriptName: name,
-                    scriptSource: scriptContent,
-                    metadataBindings: localBindings
-                });
-
-                if (deployRes.success) {
-                    appendBatchLog(\`✅ \${acc.email}: 部署成功\`, '#4ade80');
-                    
-                    const enableSubdomain = el('batchEnableSubdomain').checked;
-                    appendBatchLog(\`   ↳ 设置子域名: \${enableSubdomain ? '开启' : '关闭'}\`, '#9ca3af');
-                    const toggleRes = await api('toggle-worker-subdomain', { ...creds, scriptName: name, enabled: enableSubdomain });
-                    
-                    if (enableSubdomain) {
-                        const subRes = await api('get-workers-subdomain', creds);
-                        if (subRes.success && subRes.result.subdomain) {
-                            const fullUrl = \`https://\${name}.\${subRes.result.subdomain}.workers.dev\`;
-                            appendBatchLog(\`   🔗 \${fullUrl}\`, '#60a5fa');
-                        } else {
-                            appendBatchLog(\`   ⚠️ 无法获取子域名信息，请确认账号已配置 Workers 子域名\`, '#f59e0b');
-                        }
-                    }
-
-                } else {
-                    appendBatchLog(\`❌ \${acc.email}: \${deployRes.error}\`, '#ef4444');
-                }
-
-            } catch (e) {
-                appendBatchLog(\`❌ \${acc.email}: 异常 \${e.message}\`, '#ef4444');
-            }
-        }
-        appendBatchLog('批量操作结束', '#fcd34d');
-    }
-    window.startBatchCreate = startBatchCreate;
-
-    async function refreshWorkers() {
-      el('workersList').innerHTML = '加载中...';
-      const accounts = await api('list-accounts');
-      if (!accounts || !accounts.result) { 
-        el('workersList').innerHTML = '无法获取账户'; 
-        return; 
-      }
-      const accountId = accounts.result[0].id || accounts.result[0].account_id;
-      localStorage.setItem('cf_accountId', accountId);
-      const res = await api('list-workers', { accountId });
-      if (!res || !res.result) { 
-        el('workersList').innerHTML = '获取 Workers 失败'; 
-        return; 
-      }
-      
-      el('workersList').innerHTML = '';
-      res.result.forEach(w => {
-        const name = w.id || w.name || w.script_name;
-        const created = w.created_on || w.created_at || w.modified_on || '';
-        const defaultDomain = w.defaultDomain;
-        const domains = w.domains || [];
-        const bindings = w.bindings || [];
-        const subdomainEnabled = w.subdomainEnabled !== false;
-        
-        const envBindings = bindings.filter(b => b.type === 'plain_text' || b.type === 'secret_text');
-        const kvBindings = bindings.filter(b => b.type === 'kv_namespace');
-        const d1Bindings = bindings.filter(b => b.type === 'd1' || b.type === 'd1_database');
-        
-        const div = document.createElement('div'); 
-        div.className='worker-row';
-        div.innerHTML = \`
-          <div class="worker-info">
-            <div style="font-weight:700">\${name}</div>
-            <div class="worker-meta">创建时间：\${created}</div>
-            
-            \${defaultDomain ? \`
-              <div class="worker-domains">
-                <div class="small" style="margin-bottom:2px;">默认域名:</div>
-                <div style="display:flex;align-items:center;gap:12px">
-                  <a href="https://\${defaultDomain.hostname}" target="_blank" class="domain-tag workers-dev">
-                    \${defaultDomain.hostname}
-                    <span class="domain-status \${subdomainEnabled ? 'active' : 'inactive'}">\${subdomainEnabled ? '已启用' : '已禁用'}</span>
-                  </a>
-                  <div class="domain-control" style="margin:0">
-                     <label class="switch">
-                       <input type="checkbox" \${subdomainEnabled ? 'checked' : ''} onchange="toggleWorkerSubdomain('\${name}', this.checked)">
-                       <span class="slider"></span>
-                     </label>
-                     <span class="small" style="margin-left:8px">\${subdomainEnabled ? '已开启' : '已关闭'}</span>
-                  </div>
-                </div>
-              </div>
-            \` : '<div class="worker-meta" style="color:#ef4444">Workers 域名未设置</div>'}
-            
-            <div class="worker-domains" style="margin-top:8px">
-              <div class="small" style="margin-bottom:2px;">自定义域名:</div>
-              \${domains.length > 0 ? domains.map(domain => {
-                const status = domain.status || 'active';
-                const statusText = status === 'active' ? '已启用' : '待处理';
-                const statusClass = status === 'active' ? 'active' : 'pending';
-                
-                return \`
-                  <div style="display:inline-block;position:relative">
-                    <a href="https://\${escapeHtml(domain.hostname)}" target="_blank" class="domain-tag">
-                      \${escapeHtml(domain.hostname)}
-                      <span class="domain-status \${statusClass}">\${statusText}</span>
-                    </a>
-                    <span class="del-domain-btn" title="删除域名" onclick="deleteWorkerDomain('\${name}', '\${domain.id}', '\${escapeHtml(domain.hostname)}')">✕</span>
-                  </div>
-                \`;
-              }).join('') : '<span class="small" style="color:#94a3b8">暂无自定义域名</span>'}
-            </div>
-          </div>
-          
-          <div class="worker-right">
-            <div class="worker-tags">
-              \${envBindings.map(b => \`<span class="res-tag env">ENV: \${escapeHtml(b.name)}</span>\`).join('')}
-              \${kvBindings.map(b => \`<span class="res-tag kv">KV: \${escapeHtml(b.name)}</span>\`).join('')}
-              \${d1Bindings.map(b => \`<span class="res-tag d1">D1: \${escapeHtml(b.name)}</span>\`).join('')}
-            </div>
-
-            <div class="btns">
-              <button class="btn" data-name="\${name}" data-act="env">环境</button>
-              <button class="btn" data-name="\${name}" data-act="bind">绑定资源</button>
-              <button class="btn" data-name="\${name}" data-act="addDomain">绑定域名</button>
-              <button class="btn" data-name="\${name}" data-act="edit">编辑</button>
-              <button class="btn danger" data-name="\${name}" data-act="delete">删除</button>
-            </div>
-          </div>
-        \`;
-        el('workersList').appendChild(div);
-      });
-      
-      Array.from(document.querySelectorAll('.btns .btn')).forEach(b => {
-        b.addEventListener('click', async function(e) {
-          e.stopPropagation();
-          const act = this.dataset.act; 
-          const name = this.dataset.name;
-          if (act === 'env') openEnvFor(name);
-          if (act === 'bind') openBindFor(name);
-          if (act === 'edit') editWorker(name);
-          if (act === 'delete') deleteWorker(name);
-          if (act === 'addDomain') openAddDomainModal(name);
-        });
-      });
-
-      updateWorkerMetrics();
-    }
-
-    async function toggleWorkerSubdomain(scriptName, enabled) { const accountId = localStorage.getItem('cf_accountId'); const res = await api('toggle-worker-subdomain', { accountId, scriptName, enabled }); if (res && res.success) { showNotification(enabled ? 'Workers 子域名已启用' : 'Workers 子域名已禁用'); setTimeout(refreshWorkers, 1000); } else { showNotification(res.error || '操作失败', 'error'); refreshWorkers(); } }
-    
-    let currentWorkerForDomain = '';
-    function openAddDomainModal(scriptName) { currentWorkerForDomain = scriptName; el('newDomainInput').value = ''; el('addDomainModal').style.display = 'flex'; }
-    function closeAddDomainModal() { el('addDomainModal').style.display = 'none'; currentWorkerForDomain = ''; }
-    async function confirmAddDomain() { const hostname = el('newDomainInput').value.trim(); const scriptName = currentWorkerForDomain; if (!hostname) return showNotification('请输入域名', 'error'); const accountId = localStorage.getItem('cf_accountId'); const res = await api('add-worker-domain', { accountId, scriptName, hostname }); if (res && res.success) { showNotification('域名绑定成功'); closeAddDomainModal(); refreshWorkers(); } else { showNotification(res.error || '绑定失败', 'error'); } }
-    async function deleteWorkerDomain(scriptName, domainId, hostname) { if (!confirm('确定要解除绑定域名 ' + hostname + ' 吗？')) return; const accountId = localStorage.getItem('cf_accountId'); const res = await api('delete-worker-domain', { accountId, scriptName, domainId, hostname }); if (res && res.success) { showNotification('域名解绑成功'); refreshWorkers(); } else { showNotification(res.error || '解绑失败', 'error'); } }
-
-    async function updateWorkerMetrics() { try { const usageRes = await api('get-usage-today', { accountId: localStorage.getItem('cf_accountId') }); if (usageRes && usageRes.success && usageRes.data) { const data = usageRes.data; const total = data.total || 0; const workers = data.workers || 0; const pages = data.pages || 0; const percentage = data.percentage || 0; el('metricCount').textContent = \`\${total.toLocaleString()} / 100,000\`; el('metricBar').style.width = \`\${percentage}%\`; el('workersRequests').textContent = workers.toLocaleString(); el('pagesRequests').textContent = pages.toLocaleString(); } else { el('metricCount').textContent = '0 / 100,000'; el('metricBar').style.width = '0%'; el('workersRequests').textContent = '0'; el('pagesRequests').textContent = '0'; } } catch (e) { console.error(e); } }
-    async function editWorker(name){ const accounts = await api('list-accounts'); const accountId = accounts.result?.[0]?.id; const res = await api('get-worker-script', { accountId, scriptName: name }); if (res && res.rawScript !== undefined) { el('createName').value = name; el('createScript').value = res.rawScript; el('createModal').style.display='flex'; } else { showNotification('获取 Worker 脚本失败', 'error'); debugOut(res); } }
-    async function confirmCreate(){ const name = el('createName').value.trim(); const script = el('createScript').value; if (!name) return showNotification('请输入 Worker 名称', 'error'); const accountId = (await api('list-accounts')).result?.[0]?.id; const res = await api('deploy-worker', { accountId, scriptName: name, scriptSource: script, metadataBindings: [] }); if (res && res.success) { showNotification(res.message || 'Worker 部署成功'); el('createModal').style.display='none'; setTimeout(refreshWorkers, 800); } else { showNotification(res.error || '部署失败', 'error'); debugOut(res); } }
-    function closeCreate(){ el('createModal').style.display='none'; }
-    async function deleteWorker(name){ if (!confirm('确定要删除 Worker: '+name+' 吗？')) return; const accountId = (await api('list-accounts')).result?.[0]?.id; const res = await api('delete-worker', { accountId, scriptName: name }); if (res && res.success) { showNotification(res.message || 'Worker 删除成功'); setTimeout(refreshWorkers, 600); } else { showNotification(res.error || '删除失败', 'error'); debugOut(res); } }
-    
-    let currentWorkerForEnv = '';
-    async function loadEnvVars(scriptName) { currentWorkerForEnv = scriptName; const accountId = localStorage.getItem('cf_accountId'); const res = await api('get-worker-variables', { accountId, scriptName }); el('envRows').innerHTML = ''; if (res && res.result && res.result.vars) { res.result.vars.forEach(v => { let value = v.value || v.text || ''; if (v.type === 'json' || (value && value.startsWith('{') && value.endsWith('}'))) { try { value = JSON.stringify(JSON.parse(value), null, 2); } catch (e) {} } addEnvRow(v.name, v.type || 'plain_text', value); }); } else { addEnvRow(); } }
-    function addEnvRow(name='',type='plain_text',value=''){ const rows=el('envRows'); const id='r_'+Math.random().toString(36).slice(2,8); const div=document.createElement('div'); div.id=id; div.style.display='flex'; div.style.gap='8px'; div.style.marginTop='8px'; div.style.alignItems='center'; div.innerHTML = \`<input class="input env-name" placeholder="变量名" value="\${name?escapeHtml(name):''}" style="flex:2"><select class="input env-type" style="width:140px"><option value="plain_text">文本</option><option value="secret_text">密钥</option><option value="json">JSON</option></select><textarea class="input env-value" placeholder="变量值" style="flex:3;min-height:60px;resize:vertical">\${value?escapeHtml(value):''}</textarea><button class="btn danger">删除</button>\`; rows.appendChild(div); div.querySelector('button').addEventListener('click', ()=>div.remove()); div.querySelector('select').value=type; }
-    async function saveEnv(){ const script = currentWorkerForEnv; if(!script) return showNotification('请选择 Worker 名称', 'error'); const rows = Array.from(el('envRows').children); const vars=[]; for(const row of rows){ const name = row.querySelector('.env-name').value.trim(); const type = row.querySelector('.env-type').value; let value = row.querySelector('.env-value').value; if(!name) continue; if(type==='json'){ try{ JSON.parse(value); }catch{ showNotification('JSON 变量格式错误: '+name, 'error'); return; } } vars.push({ name, value, type }); } const accountId = localStorage.getItem('cf_accountId') || (await api('list-accounts')).result?.[0]?.id; const res = await api('put-worker-variables', { accountId, scriptName: script, variables: vars }); if (res && res.success) { showNotification(res.message || '环境变量保存成功'); el('envModal').style.display='none'; refreshWorkers(); } else { showNotification(res.error || '保存失败', 'error'); debugOut(res); } }
-    function closeEnvModal(){ el('envModal').style.display='none'; }
-    
-    async function refreshKVNamespaces() { const accountId = localStorage.getItem('cf_accountId'); if (!accountId) return; const res = await api('list-kv-namespaces', { accountId }); const namespaces = res.result || []; el('kvNamespacesList').innerHTML = ''; if (namespaces.length === 0) { el('kvNamespacesList').innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无 KV 命名空间</div>'; return; } namespaces.forEach(ns => { const div = document.createElement('div'); div.className = 'kv-item'; div.innerHTML = \`<div style="flex:1"><div style="font-weight:600">\${ns.title || ns.id}</div><div class="small">ID: \${ns.id}</div></div><div class="btns"><button class="btn" data-id="\${ns.id}" data-act="view">查看键值</button><button class="btn danger" data-id="\${ns.id}" data-act="delete">删除</button></div>\`; el('kvNamespacesList').appendChild(div); }); Array.from(el('kvNamespacesList').querySelectorAll('.btn')).forEach(btn => { btn.addEventListener('click', function() { const namespaceId = this.dataset.id; const act = this.dataset.act; if (act === 'view') viewKVNamespace(namespaceId); if (act === 'delete') deleteKVNamespace(namespaceId); }); }); }
-    async function viewKVNamespace(namespaceId) { const accountId = localStorage.getItem('cf_accountId'); const res = await api('list-kv-keys', { accountId, namespaceId }); if (res && res.result) { const keys = res.result; let content = '<h4>KV 键值列表</h4>'; if (keys.length === 0) { content += '<p>暂无键值对</p>'; } else { content += '<ul>'; keys.forEach(key => { content += \`<li>\${key.name}</li>\`; }); content += '</ul>'; } el('debugOut').innerHTML = content; el('outModal').style.display = 'flex'; } else { showNotification('获取键值列表失败', 'error'); } }
-    async function deleteKVNamespace(namespaceId) { if (!confirm('确定要删除此 KV 命名空间吗？此操作不可逆！')) return; const accountId = localStorage.getItem('cf_accountId'); const res = await api('delete-kv-namespace', { accountId, namespaceId }); if (res && res.success) { showNotification('KV 命名空间删除成功'); refreshKVNamespaces(); } else { showNotification(res.error || '删除失败', 'error'); } }
-    function closeCreateKVModal(){ el('createKVModal').style.display='none'; }
-    async function confirmCreateKVNamespace() { const name = el('kvNamespaceName').value.trim(); if (!name) return showNotification('请输入命名空间名称', 'error'); const accountId = localStorage.getItem('cf_accountId'); const res = await api('create-kv-namespace', { accountId, title: name }); if (res && res.result) { showNotification('KV 命名空间创建成功'); el('createKVModal').style.display = 'none'; refreshKVNamespaces(); } else { showNotification(res.error || '创建失败', 'error'); } }
-    
-    async function refreshD1Databases() { const accountId = localStorage.getItem('cf_accountId'); if (!accountId) return; const res = await api('list-d1', { accountId }); const databases = res.result || []; el('d1DatabasesList').innerHTML = ''; el('d1DatabaseSelect').innerHTML = '<option value="">- 选择数据库 -</option>'; if (databases.length === 0) { el('d1DatabasesList').innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无 D1 数据库</div>'; return; } databases.forEach(db => { const div = document.createElement('div'); div.className = 'kv-item'; div.innerHTML = \`<div style="flex:1"><div style="font-weight:600">\${db.name || db.id}</div><div class="small">ID: \${db.uuid || db.id} | 版本: \${db.version || 'N/A'}</div></div><div class="btns"><button class="btn danger" data-id="\${db.uuid || db.id}" data-act="delete">删除</button></div>\`; el('d1DatabasesList').appendChild(div); const option = document.createElement('option'); option.value = db.uuid || db.id; option.textContent = \`\${db.name} (\${db.uuid || db.id})\`; el('d1DatabaseSelect').appendChild(option); }); Array.from(el('d1DatabasesList').querySelectorAll('.btn')).forEach(btn => { btn.addEventListener('click', function() { const databaseId = this.dataset.id; const act = this.dataset.act; if (act === 'delete') deleteD1Database(databaseId); }); }); }
-    async function deleteD1Database(databaseId) { if (!confirm('确定要删除此 D1 数据库吗？此操作不可逆！')) return; const accountId = localStorage.getItem('cf_accountId'); const res = await api('delete-d1-database', { accountId, databaseId }); if (res && res.success) { showNotification('D1 数据库删除成功'); refreshD1Databases(); } else { showNotification(res.error || '删除失败', 'error'); } }
-    function closeCreateD1Modal(){ el('createD1Modal').style.display='none'; }
-    async function confirmCreateD1Database() { const name = el('d1DatabaseName').value.trim(); const location = el('d1Location').value; if (!name) return showNotification('请输入数据库名称', 'error'); const accountId = localStorage.getItem('cf_accountId'); const payload = { accountId, name }; if (location && location !== 'auto') { payload.primary_location_hint = location; } const res = await api('create-d1-database', payload); if (res && res.result) { showNotification('D1 数据库创建成功'); el('createD1Modal').style.display = 'none'; refreshD1Databases(); } else { showNotification(res.error || '创建失败', 'error'); } }
-    async function executeD1Query() { const databaseId = el('d1DatabaseSelect').value; const query = el('d1Query').value.trim(); if (!databaseId || !query) return showNotification('请选择数据库并输入查询语句', 'error'); const accountId = localStorage.getItem('cf_accountId'); const res = await api('execute-d1-query', { accountId, databaseId, query }); if (res && res.result) { el('d1QueryResults').innerHTML = '<pre>' + JSON.stringify(res.result, null, 2) + '</pre>'; } else { showNotification(res.error || '查询失败', 'error'); } }
-    function refreshD1Tables() { }
-
-    let currentZoneId = null; let currentEditingRecord = null;
-    async function refreshZones() { const res = await api('list-zones'); const zones = res.result || []; el('zonesList').innerHTML = ''; if (zones.length === 0) { el('zonesList').innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无域名</div>'; return; } const table = document.createElement('table'); table.className = 'domain-list-table'; table.innerHTML = \`<thead><tr><th>域名</th><th style="width:100px">状态</th><th>区域 ID (Zone ID)</th><th style="width:120px;text-align:right">操作</th></tr></thead><tbody></tbody>\`; const tbody = table.querySelector('tbody'); zones.forEach(zone => { const row = document.createElement('tr'); let statusHtml = \`\`; if (zone.status === 'active') { statusHtml = '<span style="background:#f0fdf4;color:#166534;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600">已激活</span>'; } else { statusHtml = '<span style="background:#fffbeb;color:#d97706;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600">待处理</span>'; } let nsSection = ''; if (zone.status === 'pending' && zone.name_servers && zone.name_servers.length > 0) { nsSection = \`<div style="margin-top:8px;font-size:12px;color:#64748b">请设置 NS 为:</div><div style="display:flex;flex-wrap:wrap;gap:0;margin-top:4px">\`; zone.name_servers.forEach(ns => { nsSection += \`<div class="ns-pill">\${ns}<span class="ns-copy-icon" onclick="event.stopPropagation(); copyToClipboard('\${ns}', event)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></span></div>\`; }); nsSection += \`<button class="copy-btn" style="margin-left:4px;height:20px;padding:0 6px" onclick="event.stopPropagation(); copyToClipboard('\${zone.name_servers.join(', ')}', event)">复制全部</button></div>\`; } row.innerHTML = \`<td><div style="font-weight:600;font-size:14px">\${escapeHtml(zone.name)}</div><div style="font-size:11px;color:#64748b;margin-top:2px">计划: \${zone.plan?.name || 'Free'}</div>\${nsSection}</td><td>\${statusHtml}</td><td style="font-family:monospace;color:#64748b;font-size:11px">\${zone.id}</td><td><div class="domain-row-actions"><button class="trash-btn" style="color:#2563eb;border-color:#dbeafe;background:#eff6ff" title="管理 DNS" onclick="event.stopPropagation(); viewZoneDNS('\${zone.id}', '\${escapeHtml(zone.name)}')">管理 DNS</button><button class="trash-btn" title="删除域名" onclick="event.stopPropagation(); deleteZone('\${zone.id}')">删除</button></div></td>\`; tbody.appendChild(row); }); el('zonesList').appendChild(table); window.viewZoneDNS = viewZoneDNS; window.deleteZone = deleteZone; }
-    function showZonesList() { el('zonesList').style.display = 'block'; el('dnsRecordsSection').style.display = 'none'; currentZoneId = null; refreshZones(); }
-    function viewZoneDNS(zoneId, zoneName) { currentZoneId = zoneId; el('zonesList').style.display = 'none'; el('dnsRecordsSection').style.display = 'block'; el('selectedZoneName').textContent = \`\${zoneName} - DNS 记录管理\`; el('selectedZoneInfo').textContent = \`管理 \${zoneName} 的 DNS 记录\`; refreshDNSRecords(zoneId); }
-    function backToZones() { showZonesList(); }
-    async function refreshDNSRecords(zoneId) { const res = await api('list-dns-records', { zoneId }); const records = res.result || []; el('dnsRecordsList').innerHTML = ''; if (records.length === 0) { el('dnsRecordsList').innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无 DNS 记录</div>'; return; } const table = document.createElement('table'); table.className = 'dns-table'; table.innerHTML = \`<thead><tr><th>类型</th><th>名称</th><th>内容</th><th>TTL</th><th>代理</th><th>操作</th></tr></thead><tbody></tbody>\`; const tbody = table.querySelector('tbody'); records.forEach(record => { const row = document.createElement('tr'); row.innerHTML = \`<td>\${record.type}</td><td>\${record.name}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${record.content}</td><td>\${record.ttl}</td><td>\${record.proxied ? '开启' : '关闭'}</td><td><button class="btn small" data-id="\${record.id}" data-act="edit">编辑</button><button class="btn small danger" data-id="\${record.id}" data-act="delete">删除</button></td>\`; tbody.appendChild(row); }); el('dnsRecordsList').appendChild(table); Array.from(el('dnsRecordsList').querySelectorAll('.btn')).forEach(btn => { btn.addEventListener('click', function() { const recordId = this.dataset.id; const act = this.dataset.act; if (act === 'edit') editDNSRecord(zoneId, recordId); if (act === 'delete') deleteDNSRecord(zoneId, recordId); }); }); }
-    async function editDNSRecord(zoneId, recordId) { const res = await api('list-dns-records', { zoneId }); const record = res.result.find(r => r.id === recordId); if (record) { currentEditingRecord = record; el('editDnsRecordType').value = record.type; el('editDnsRecordName').value = record.name; el('editDnsRecordContent').value = record.content; el('editDnsRecordTTL').value = record.ttl; el('editDnsRecordProxied').checked = record.proxied; el('editDNSRecordModal').style.display = 'flex'; } }
-    async function confirmEditDNSRecord() { const zoneId = currentZoneId; const recordId = currentEditingRecord.id; const type = el('editDnsRecordType').value; const name = el('editDnsRecordName').value.trim(); const content = el('editDnsRecordContent').value.trim(); const ttl = parseInt(el('editDnsRecordTTL').value); const proxied = el('editDnsRecordProxied').checked; if (!zoneId || !type || !name || !content) { return showNotification('请填写完整的 DNS 记录信息', 'error'); } const res = await api('update-dns-record', { zoneId, recordId, type, name, content, ttl, proxied }); if (res && res.result) { showNotification('DNS 记录更新成功'); el('editDNSRecordModal').style.display = 'none'; currentEditingRecord = null; refreshDNSRecords(zoneId); } else { showNotification(res.error || '更新失败', 'error'); } }
-    function closeEditDNSRecordModal() { el('editDNSRecordModal').style.display = 'none'; currentEditingRecord = null; }
-    async function confirmAddDNSRecord() { const zoneId = currentZoneId; const type = el('dnsRecordType').value; const name = el('dnsRecordName').value.trim(); const content = el('dnsRecordContent').value.trim(); const ttl = parseInt(el('dnsRecordTTL').value); const proxied = el('dnsRecordProxied').checked; if (!zoneId || !type || !name || !content) { return showNotification('请填写完整的 DNS 记录信息', 'error'); } const res = await api('create-dns-record', { zoneId, type, name, content, ttl, proxied }); if (res && res.result) { showNotification('DNS 记录添加成功'); el('addDNSRecordModal').style.display = 'none'; refreshDNSRecords(zoneId); } else { showNotification(res.error || '添加失败', 'error'); } }
-    function closeAddDNSRecordModal() { el('addDNSRecordModal').style.display = 'none'; }
-    async function deleteDNSRecord(zoneId, recordId) { if (!confirm('确定要删除此 DNS 记录吗？')) return; const res = await api('delete-dns-record', { zoneId, recordId }); if (res && res.success) { showNotification('DNS 记录删除成功'); refreshDNSRecords(zoneId); } else { showNotification(res.error || '删除失败', 'error'); } }
-    async function deleteZone(zoneId) { if (!confirm('确定要删除此域名吗？此操作不可逆！')) return; const res = await api('delete-zone', { zoneId }); if (res && res.success) { showNotification('域名删除成功'); refreshZones(); } else { showNotification(res.error || '删除失败', 'error'); } }
-    function closeAddZoneModal() { el('addZoneModal').style.display = 'none'; }
-    async function confirmAddZone() { const name = el('zoneName').value.trim(); if (!name) return showNotification('请输入域名', 'error'); const res = await api('create-zone', { name }); if (res && res.result) { showNotification('域名添加成功，请在域名注册商处修改 NS 记录'); el('addZoneModal').style.display = 'none'; refreshZones(); } else { showNotification(res.error || '添加失败', 'error'); } }
-    async function loadSubdomainSettings() { const accountId = localStorage.getItem('cf_accountId'); if (!accountId) return; const res = await api('get-workers-subdomain', { accountId }); if (res && res.result) { const subdomain = res.result.subdomain; el('subdomainInput').value = subdomain || ''; } }
-    async function saveSubdomain() { const subdomain = el('subdomainInput').value.trim(); if (!subdomain) return showNotification('请输入子域名', 'error'); const accountId = localStorage.getItem('cf_accountId'); const res = await api('put-workers-subdomain', { accountId, subdomain }); if (res && res.success) { showNotification(res.message || 'Workers 域名设置成功'); setTimeout(refreshWorkers, 1000); } else { showNotification(res.error || '设置保存失败', 'error'); } }
-    
-    let currentBindType = 'kv';
-    async function refreshBindList(){ const type = el('bindType').value; currentBindType = type; const accountId = localStorage.getItem('cf_accountId') || (await api('list-accounts')).result?.[0]?.id; if (!accountId) { el('bindSelect').innerHTML='<option>无 account</option>'; return; } el('bindSelect').innerHTML = '<option value="">加载中...</option>'; try { if (type==='kv') { const kv = await api('list-kv-namespaces', { accountId }); const arr = kv.result || []; el('bindSelect').innerHTML=''; if(arr.length) { arr.forEach(ns=>{ const opt=document.createElement('option'); opt.value=ns.id; opt.textContent=(ns.title||ns.name||ns.id) + ' (' + ns.id + ')'; el('bindSelect').appendChild(opt); }); } else { el('bindSelect').innerHTML='<option value="">未找到 KV 命名空间</option>'; } } else { const d1 = await api('list-d1', { accountId }); const arr = d1.result || []; el('bindSelect').innerHTML=''; if(arr.length) { arr.forEach(db=>{ const id=db.uuid||db.id; const opt=document.createElement('option'); opt.value=id; opt.textContent=(db.name||db.uuid||db.id) + ' (' + id + ')'; el('bindSelect').appendChild(opt); }); } else { el('bindSelect').innerHTML='<option value="">未找到 D1 数据库</option>'; } } } catch (error) { console.error('刷新绑定列表失败:', error); el('bindSelect').innerHTML='<option value="">加载失败</option>'; } }
-    function closeBindModal(){ el('bindModal').style.display='none'; }
-    async function confirmBind(){ const type = currentBindType; const ref = el('bindSelect').value; const bindName = el('bindName').value.trim() || (type==='kv'?'MY_KV':'MY_DB'); const script = el('createName').value.trim(); if (!script) return showNotification('请选择 Worker 名称', 'error'); if (!ref) return showNotification('请选择要绑定的资源', 'error'); const accountId = localStorage.getItem('cf_accountId'); let currentScript; let currentBindings = []; try { const scriptRes = await api('get-worker-script', { accountId, scriptName: script }); if (scriptRes && scriptRes.rawScript) { currentScript = scriptRes.rawScript; const scriptInfoRes = await api('get-worker-variables', { accountId, scriptName: script }); if (scriptInfoRes && scriptInfoRes.result && scriptInfoRes.result.vars) { const fullScriptRes = await fetch(\`/api\`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: 'get-worker-script', email: getActiveCreds().email, key: getActiveCreds().key, accountId: accountId, scriptName: script }) }); const fullScriptData = await fullScriptRes.json(); if (fullScriptData && fullScriptData.rawScript) { try { const scriptJson = JSON.parse(fullScriptData.rawScript); if (scriptJson.result && scriptJson.result.bindings) { currentBindings = scriptJson.result.bindings; } } catch (e) { } } } } else { currentScript = DEFAULT_WORKER_SCRIPT; } } catch (error) { console.error('获取当前脚本失败:', error); currentScript = DEFAULT_WORKER_SCRIPT; } const newBinding = (type==='kv') ? { type:'kv_namespace', name:bindName, namespace_id:ref } : { type:'d1', name:bindName, id:ref }; const otherBindings = currentBindings.filter(b => { if (b.type === 'plain_text' || b.type === 'secret_text') return true; return !(b.type === newBinding.type && b.name === newBinding.name); }); const finalBindings = [...otherBindings, newBinding]; const res = await api('deploy-worker', { accountId, scriptName: script, scriptSource: currentScript, metadataBindings: finalBindings }); if (res && res.success) { showNotification('资源绑定成功'); el('bindModal').style.display='none'; setTimeout(refreshWorkers,800); } else { showNotification(res.error || '绑定失败', 'error'); debugOut(res); } }
-
-    (async function init() {
-      const creds = getActiveCreds();
-      if (!creds.email || !creds.key) { 
-        location.href = '/login'; 
-        return; 
-      }
-      el('acctInfo').textContent = creds.email;
-      setTimeout(() => { try { refreshWorkers(); } catch(e) { console.log(e); } }, 300);
-    })();
-
-    window.navTo = navTo;
-    window.logout = function() { localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key'); location.href = '/login'; };
-    window.openAccountSwitcher = openAccountSwitcher; window.closeAccountSwitcher = closeAccountSwitcher;
-    window.switchAccount = switchAccount; window.removeAccount = removeAccount;
-    window.openCreateWorker = function(){ el('createName').value=''; el('createScript').value = DEFAULT_WORKER_SCRIPT; el('createModal').style.display='flex'; };
-    window.openEnvFor = function(name){ el('createName').value = name; el('envModal').style.display='flex'; loadEnvVars(name); };
-    window.openBindFor = function(name){ el('createName').value = name; el('bindModal').style.display='flex'; refreshBindList(); };
-    window.addEnvRow = addEnvRow; window.saveEnv = saveEnv; window.closeEnvModal = closeEnvModal;
-    window.closeBindModal = closeBindModal; window.confirmBind = confirmBind;
-    window.editWorker = editWorker; window.deleteWorker = deleteWorker;
-    window.closeCreate = closeCreate; window.confirmCreate = confirmCreate;
-    window.closeOut = function(){ el('outModal').style.display='none'; };
-    window.openCreateKVNamespace = function(){ el('createKVModal').style.display='flex'; };
-    window.closeCreateKVModal = closeCreateKVModal; window.confirmCreateKVNamespace = confirmCreateKVNamespace;
-    window.openCreateD1Database = function(){ el('createD1Modal').style.display='flex'; };
-    window.closeCreateD1Modal = closeCreateD1Modal; window.confirmCreateD1Database = confirmCreateD1Database;
-    window.executeD1Query = executeD1Query; window.refreshD1Tables = refreshD1Tables;
-    window.openAddZone = function(){ el('addZoneModal').style.display='flex'; };
-    window.closeAddZoneModal = closeAddZoneModal; window.confirmAddZone = confirmAddZone;
-    window.openAddDNSRecord = function(){ if (!currentZoneId) { return showNotification('请先选择域名', 'error'); } el('addDNSRecordModal').style.display='flex'; };
-    window.closeAddDNSRecordModal = closeAddDNSRecordModal; window.confirmAddDNSRecord = confirmAddDNSRecord;
-    window.refreshDNSRecords = refreshDNSRecords; window.saveSubdomain = saveSubdomain;
-    window.backToZones = backToZones; window.copyToClipboard = copyToClipboard;
-    window.toggleWorkerSubdomain = toggleWorkerSubdomain;
-    window.editDNSRecord = editDNSRecord; window.confirmEditDNSRecord = confirmEditDNSRecord;
-    window.closeEditDNSRecordModal = closeEditDNSRecordModal;
-    window.refreshKVNamespaces = refreshKVNamespaces; window.refreshD1Databases = refreshD1Databases;
-    window.refreshZones = refreshZones; window.refreshBindList = refreshBindList;
-    window.openAddDomainModal = openAddDomainModal; window.closeAddDomainModal = closeAddDomainModal;
-    window.confirmAddDomain = confirmAddDomain; window.deleteWorkerDomain = deleteWorkerDomain;
-    window.viewZoneDNS = viewZoneDNS; window.deleteZone = deleteZone;
-  }
-})();`;
+  namespaces.forEach(ns => {
+    const div = document.createElement('div');
+    div.className = 'kv-item';
+    div.innerHTML = \`<div><strong>\${ns.title || ns.id}</strong><br><small>\${ns.id}</small></div>
+      <button class="btn danger" data-id="\${ns.id}" onclick="deleteKVNamespace('\${ns.id}')">删除</button>\`;
+    listDiv.appendChild(div);
+  });
 }
+
+async function deleteKVNamespace(namespaceId) {
+  if (!confirm('确定删除此 KV 命名空间吗？')) return;
+  const accountId = localStorage.getItem('cf_accountId');
+  const res = await api('delete-kv-namespace', { accountId, namespaceId });
+  if (res && res.success) {
+    showNotification('删除成功');
+    refreshKVNamespaces();
+  } else {
+    showNotification(res.error || '删除失败', 'error');
+  }
+}
+
+function openCreateKVNamespace() {
+  document.getElementById('createKVModal').style.display = 'flex';
+}
+
+function closeCreateKVModal() {
+  document.getElementById('createKVModal').style.display = 'none';
+}
+
+async function confirmCreateKVNamespace() {
+  const name = document.getElementById('kvNamespaceName').value.trim();
+  if (!name) return showNotification('请输入名称', 'error');
+  const accountId = localStorage.getItem('cf_accountId');
+  const res = await api('create-kv-namespace', { accountId, title: name });
+  if (res && res.result) {
+    showNotification('创建成功');
+    closeCreateKVModal();
+    refreshKVNamespaces();
+  } else {
+    showNotification(res.error || '创建失败', 'error');
+  }
+}
+
+async function refreshD1Databases() {
+  const listDiv = document.getElementById('d1DatabasesList');
+  if (!listDiv) return;
+  const accountId = localStorage.getItem('cf_accountId');
+  if (!accountId) { listDiv.innerHTML = '请先加载 Workers 页面'; return; }
+  const res = await api('list-d1', { accountId });
+  const dbs = res.result || [];
+  listDiv.innerHTML = '';
+  const select = document.getElementById('d1DatabaseSelect');
+  if (select) select.innerHTML = '<option value="">- 选择数据库 -</option>';
+  dbs.forEach(db => {
+    const dbId = db.uuid || db.id;
+    const dbName = db.name || dbId;
+    const div = document.createElement('div');
+    div.className = 'kv-item';
+    div.innerHTML = \`<div><strong>\${dbName}</strong><br><small>\${dbId}</small></div>
+      <button class="btn danger" data-id="\${dbId}" onclick="deleteD1Database('\${dbId}')">删除</button>\`;
+    listDiv.appendChild(div);
+    if (select) {
+      const opt = document.createElement('option');
+      opt.value = dbId;
+      opt.textContent = dbName;
+      select.appendChild(opt);
+    }
+  });
+}
+
+async function deleteD1Database(databaseId) {
+  if (!confirm('确定删除此 D1 数据库吗？')) return;
+  const accountId = localStorage.getItem('cf_accountId');
+  const res = await api('delete-d1-database', { accountId, databaseId });
+  if (res && res.success) {
+    showNotification('删除成功');
+    refreshD1Databases();
+  } else {
+    showNotification(res.error || '删除失败', 'error');
+  }
+}
+
+function openCreateD1Database() {
+  document.getElementById('createD1Modal').style.display = 'flex';
+}
+
+function closeCreateD1Modal() {
+  document.getElementById('createD1Modal').style.display = 'none';
+}
+
+async function confirmCreateD1Database() {
+  const name = document.getElementById('d1DatabaseName').value.trim();
+  if (!name) return showNotification('请输入名称', 'error');
+  const accountId = localStorage.getItem('cf_accountId');
+  const res = await api('create-d1-database', { accountId, name });
+  if (res && res.result) {
+    showNotification('创建成功');
+    closeCreateD1Modal();
+    refreshD1Databases();
+  } else {
+    showNotification(res.error || '创建失败', 'error');
+  }
+}
+
+async function executeD1Query() {
+  const databaseId = document.getElementById('d1DatabaseSelect').value;
+  const query = document.getElementById('d1Query').value.trim();
+  if (!databaseId || !query) return showNotification('请选择数据库并输入查询', 'error');
+  const accountId = localStorage.getItem('cf_accountId');
+  const res = await api('execute-d1-query', { accountId, databaseId, query });
+  const resultsDiv = document.getElementById('d1QueryResults');
+  if (res && res.result) {
+    resultsDiv.innerHTML = '<pre>' + JSON.stringify(res.result, null, 2) + '</pre>';
+  } else {
+    resultsDiv.innerHTML = '<div style="color:#ef4444">查询失败</div>';
+  }
+}
+
+async function refreshZones() {
+  const listDiv = document.getElementById('zonesList');
+  if (!listDiv) return;
+  const res = await api('list-zones');
+  const zones = res.result || [];
+  listDiv.innerHTML = '';
+  if (zones.length === 0) {
+    listDiv.innerHTML = '<div>暂无域名</div>';
+    return;
+  }
+  zones.forEach(zone => {
+    const div = document.createElement('div');
+    div.className = 'zone-row';
+    div.innerHTML = \`
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div><strong>\${zone.name}</strong> <span style="color:#666">(\${zone.status})</span></div>
+        <div>
+          <button class="btn small" onclick="viewZoneDNS('\${zone.id}')">DNS 记录</button>
+          <button class="btn small danger" onclick="deleteZone('\${zone.id}')">删除</button>
+        </div>
+      </div>
+    \`;
+    listDiv.appendChild(div);
+  });
+}
+
+function openAddZone() {
+  document.getElementById('addZoneModal').style.display = 'flex';
+}
+
+function closeAddZoneModal() {
+  document.getElementById('addZoneModal').style.display = 'none';
+}
+
+async function confirmAddZone() {
+  const name = document.getElementById('zoneName').value.trim();
+  if (!name) return showNotification('请输入域名', 'error');
+  const res = await api('create-zone', { name });
+  if (res && res.result) {
+    showNotification('域名添加成功');
+    closeAddZoneModal();
+    refreshZones();
+  } else {
+    showNotification(res.error || '添加失败', 'error');
+  }
+}
+
+async function deleteZone(zoneId) {
+  if (!confirm('确定删除此域名吗？')) return;
+  const res = await api('delete-zone', { zoneId });
+  if (res && res.success) {
+    showNotification('删除成功');
+    refreshZones();
+  } else {
+    showNotification(res.error || '删除失败', 'error');
+  }
+}
+
+async function viewZoneDNS(zoneId) {
+  currentZoneId = zoneId;
+  document.getElementById('zonesList').style.display = 'none';
+  document.getElementById('dnsRecordsSection').style.display = 'block';
+  await refreshDNSRecords(zoneId);
+}
+
+function backToZones() {
+  currentZoneId = null;
+  document.getElementById('zonesList').style.display = 'block';
+  document.getElementById('dnsRecordsSection').style.display = 'none';
+}
+
+async function refreshDNSRecords(zoneId) {
+  const listDiv = document.getElementById('dnsRecordsList');
+  if (!listDiv) return;
+  const res = await api('list-dns-records', { zoneId });
+  const records = res.result || [];
+  listDiv.innerHTML = '';
+  if (records.length === 0) {
+    listDiv.innerHTML = '<div>暂无 DNS 记录</div>';
+    return;
+  }
+  const table = '<table class="dns-table"><thead><tr><th>类型</th><th>名称</th><th>内容</th><th>TTL</th><th>代理</th><th>操作</th></tr></thead><tbody>' +
+    records.map(r => \`
+      <tr>
+        <td>\${r.type}</td>
+        <td>\${r.name}</td>
+        <td>\${r.content}</td>
+        <td>\${r.ttl}</td>
+        <td>\${r.proxied ? '开启' : '关闭'}</td>
+        <td><button class="btn small" onclick="editDNSRecord('\${zoneId}', '\${r.id}')">编辑</button>
+            <button class="btn small danger" onclick="deleteDNSRecord('\${zoneId}', '\${r.id}')">删除</button></td>
+      </tr>
+    \`).join('') + '</tbody></table>';
+  listDiv.innerHTML = table;
+}
+
+function openAddDNSRecord() {
+  document.getElementById('addDNSRecordModal').style.display = 'flex';
+}
+
+function closeAddDNSRecordModal() {
+  document.getElementById('addDNSRecordModal').style.display = 'none';
+}
+
+async function confirmAddDNSRecord() {
+  const type = document.getElementById('dnsRecordType').value;
+  const name = document.getElementById('dnsRecordName').value.trim();
+  const content = document.getElementById('dnsRecordContent').value.trim();
+  const ttl = parseInt(document.getElementById('dnsRecordTTL').value);
+  const proxied = document.getElementById('dnsRecordProxied').checked;
+  const res = await api('create-dns-record', { zoneId: currentZoneId, type, name, content, ttl, proxied });
+  if (res && res.result) {
+    showNotification('DNS 记录添加成功');
+    closeAddDNSRecordModal();
+    refreshDNSRecords(currentZoneId);
+  } else {
+    showNotification(res.error || '添加失败', 'error');
+  }
+}
+
+async function deleteDNSRecord(zoneId, recordId) {
+  if (!confirm('确定删除此 DNS 记录吗？')) return;
+  const res = await api('delete-dns-record', { zoneId, recordId });
+  if (res && res.success) {
+    showNotification('删除成功');
+    refreshDNSRecords(zoneId);
+  } else {
+    showNotification(res.error || '删除失败', 'error');
+  }
+}
+
+async function saveSubdomain() {
+  const subdomain = document.getElementById('subdomainInput').value.trim();
+  if (!subdomain) return showNotification('请输入子域名', 'error');
+  const accountId = localStorage.getItem('cf_accountId');
+  const res = await api('put-workers-subdomain', { accountId, subdomain });
+  if (res && res.success) {
+    showNotification('设置成功');
+  } else {
+    showNotification(res.error || '设置失败', 'error');
+  }
+}
+
+function closeOut() {
+  document.getElementById('outModal').style.display = 'none';
+}
+
+// 批量创建相关
+function addBatchEnvRow() {
+  const container = document.getElementById('batchEnvList');
+  const div = document.createElement('div');
+  div.className = 'env-row-batch';
+  div.innerHTML = '<input class="input b-env-key" placeholder="Key" style="flex:1"><input class="input b-env-val" placeholder="Value" style="flex:1"><button class="trash-btn" onclick="this.parentElement.remove()">✕</button>';
+  container.appendChild(div);
+}
+
+function toggleBatchSourceInput() {
+  const type = document.getElementById('batchScriptSourceType').value;
+  document.getElementById('batchSourceBuiltinDiv').style.display = type === 'builtin' ? 'block' : 'none';
+  document.getElementById('batchSourceUrlDiv').style.display = type === 'url' ? 'block' : 'none';
+}
+
+async function startBatchCreate() {
+  const name = document.getElementById('batchWorkerName').value.trim();
+  if (!name) return alert('请输入 Worker 名称');
+  
+  const sourceType = document.getElementById('batchScriptSourceType').value;
+  let scriptContent = DEFAULT_WORKER_SCRIPT;
+  
+  if (sourceType === 'url') {
+    const url = document.getElementById('batchScriptUrl').value.trim();
+    if (!url) return alert('请输入脚本链接');
+    const res = await api('fetch-external-script', { url });
+    if (res.success) scriptContent = res.content;
+    else return alert('获取脚本失败: ' + res.error);
+  }
+  
+  const bindings = [];
+  document.querySelectorAll('#batchEnvList .env-row-batch').forEach(row => {
+    const key = row.querySelector('.b-env-key').value.trim();
+    const value = row.querySelector('.b-env-val').value;
+    if (key) bindings.push({ type: 'plain_text', name: key, text: value });
+  });
+  
+  const res = await api('deploy-worker', { scriptName: name, scriptSource: scriptContent, metadataBindings: bindings });
+  if (res && res.success) {
+    showNotification('Worker 创建成功');
+    if (document.getElementById('batchEnableSubdomain').checked) {
+      const accounts = await api('list-accounts');
+      const accountId = accounts.result?.[0]?.id;
+      await api('toggle-worker-subdomain', { accountId, scriptName: name, enabled: true });
+    }
+    navTo('workers');
+  } else {
+    alert('部署失败: ' + (res.error || '未知错误'));
+  }
+}
+
+// 初始化
+document.addEventListener('DOMContentLoaded', () => {
+  const sessionToken = getSessionToken();
+  if (!sessionToken) {
+    window.location.href = '/login';
+    return;
+  }
+  
+  // 设置导航点击事件
+  document.querySelectorAll('.nav .item').forEach(item => {
+    item.addEventListener('click', () => navTo(item.dataset.page));
+  });
+  
+  // 默认显示 workers 页面
+  navTo('workers');
+});
+
+// 导出全局函数
+window.navTo = navTo;
+window.logout = logout;
+window.openCreateWorker = openCreateWorker;
+window.closeCreate = closeCreate;
+window.confirmCreate = confirmCreate;
+window.refreshWorkers = refreshWorkers;
+window.openCreateKVNamespace = openCreateKVNamespace;
+window.closeCreateKVModal = closeCreateKVModal;
+window.confirmCreateKVNamespace = confirmCreateKVNamespace;
+window.deleteKVNamespace = deleteKVNamespace;
+window.openCreateD1Database = openCreateD1Database;
+window.closeCreateD1Modal = closeCreateD1Modal;
+window.confirmCreateD1Database = confirmCreateD1Database;
+window.deleteD1Database = deleteD1Database;
+window.executeD1Query = executeD1Query;
+window.openAddZone = openAddZone;
+window.closeAddZoneModal = closeAddZoneModal;
+window.confirmAddZone = confirmAddZone;
+window.deleteZone = deleteZone;
+window.viewZoneDNS = viewZoneDNS;
+window.backToZones = backToZones;
+window.openAddDNSRecord = openAddDNSRecord;
+window.closeAddDNSRecordModal = closeAddDNSRecordModal;
+window.confirmAddDNSRecord = confirmAddDNSRecord;
+window.deleteDNSRecord = deleteDNSRecord;
+window.saveSubdomain = saveSubdomain;
+window.closeOut = closeOut;
+window.addBatchEnvRow = addBatchEnvRow;
+window.toggleBatchSourceInput = toggleBatchSourceInput;
+window.startBatchCreate = startBatchCreate;`;
+}
+
+// 注意：由于 static.js 可能仍较长，请确保完整复制上述 renderStaticJS 内容
