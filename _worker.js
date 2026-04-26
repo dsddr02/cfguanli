@@ -663,155 +663,25 @@ if (action === 'add-account') {
         return json({ success: false, error: 'Error' }); 
       }
       
-      // 修复 get-usage-today - 同时统计 Workers 和 Pages
-case 'get-usage-today': { 
-  if (!payload.accountId) return json({ success: false, error: 'accountId required' }, 400); 
-  const { accountId, email, key: apikey } = payload; 
-  
-  try {
-    const now = new Date();
-    const end = now.toISOString();
-    now.setUTCHours(0, 0, 0, 0);
-    const start = now.toISOString();
-    
-    let workersRequests = 0;
-    let pagesRequests = 0;
-    
-    // 使用 GraphQL 同时查询 Workers 和 Pages
-    try {
-      const graphqlQuery = {
-        query: `query {
-          viewer {
-            accounts(filter: {accountTag: "${accountId}"}) {
-              workersInvocationsAdaptive(
-                limit: 100,
-                filter: {
-                  datetime_geq: "${start}",
-                  datetime_lt: "${end}"
-                }
-              ) {
-                sum {
-                  requests
-                }
-              }
-              pagesFunctionsInvocationsAdaptive(
-                limit: 100,
-                filter: {
-                  datetime_geq: "${start}",
-                  datetime_lt: "${end}"
-                }
-              ) {
-                sum {
-                  requests
-                }
-              }
-            }
-          }
-        }`
-      };
-      
-      const graphqlRes = await fetch("https://api.cloudflare.com/client/v4/graphql", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Auth-Email": email,
-          "X-Auth-Key": apikey
-        },
-        body: JSON.stringify(graphqlQuery)
-      });
-      
-      if (graphqlRes.ok) {
-        const data = await graphqlRes.json();
-        const account = data?.data?.viewer?.accounts?.[0];
-        
-        // 统计 Workers 请求
-        const workersInvocations = account?.workersInvocationsAdaptive || [];
-        for (const inv of workersInvocations) {
-          if (inv.sum?.requests) {
-            workersRequests += inv.sum.requests;
-          }
-        }
-        
-        // 统计 Pages 请求
-        const pagesInvocations = account?.pagesFunctionsInvocationsAdaptive || [];
-        for (const inv of pagesInvocations) {
-          if (inv.sum?.requests) {
-            pagesRequests += inv.sum.requests;
-          }
-        }
+      case 'get-usage-today': { 
+        if (!payload.accountId) return json({ success:false },400); 
+        const { accountId, email, key: apikey } = payload; 
+        const now=new Date(); 
+        const end=now.toISOString(); 
+        now.setUTCHours(0,0,0,0); 
+        const start=now.toISOString(); 
+        try { 
+          const r=await fetch("https://api.cloudflare.com/client/v4/graphql",{method:"POST",headers:{"Content-Type":"application/json","X-Auth-Email":email,"X-Auth-Key":apikey},body:JSON.stringify({query:`query getBillingMetrics($accountId:String!,$filter:AccountWorkersInvocationsAdaptiveFilter_InputObject){viewer{accounts(filter:{accountTag:$accountId}){pagesFunctionsInvocationsAdaptiveGroups(limit:1000,filter:$filter){sum{requests}}workersInvocationsAdaptive(limit:10000,filter:$filter){sum{requests}}}}}`,variables:{accountId,filter:{datetime_geq:start,datetime_leq:end}}})}); 
+          if(!r.ok) return json({success:true,data:{total:0,workers:0,pages:0,percentage:0}}); 
+          const res=await r.json(); 
+          const ac=res?.data?.viewer?.accounts?.[0]; 
+          const p=(ac?.pagesFunctionsInvocationsAdaptiveGroups||[]).reduce((t,i)=>t+(i?.sum?.requests||0),0); 
+          const w=(ac?.workersInvocationsAdaptive||[]).reduce((t,i)=>t+(i?.sum?.requests||0),0); 
+          return json({success:true,data:{total:p+w,workers:w,pages:p,percentage:Math.min(100,((p+w)/100000)*100)}}); 
+        } catch(e){ 
+          return json({success:true,data:{total:0,workers:0,pages:0,percentage:0}}); 
+        } 
       }
-    } catch (e) {
-      console.error('GraphQL error:', e);
-    }
-    
-    // 如果 GraphQL 没有数据，尝试通过 REST API 获取 Workers 数据
-    if (workersRequests === 0 && pagesRequests === 0) {
-      try {
-        // 获取所有 Workers 脚本
-        const scriptsRes = await cfGet(`/accounts/${accountId}/workers/scripts`, email, apikey);
-        if (scriptsRes.success && scriptsRes.result) {
-          for (const script of scriptsRes.result) {
-            try {
-              const analyticsUrl = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${script.id}/analytics/summary?since=${start}&until=${end}`;
-              const analyticsRes = await fetch(analyticsUrl, {
-                headers: { 'X-Auth-Email': email, 'X-Auth-Key': apikey }
-              });
-              if (analyticsRes.ok) {
-                const data = await analyticsRes.json();
-                if (data.result && data.result.requests) {
-                  workersRequests += data.result.requests;
-                }
-              }
-            } catch (e) {}
-          }
-        }
-        
-        // 获取 Pages 项目（需要额外 API）
-        try {
-          const pagesRes = await cfGet(`/accounts/${accountId}/pages/projects`, email, apikey);
-          if (pagesRes.success && pagesRes.result) {
-            for (const project of pagesRes.result) {
-              try {
-                // Pages 的 analytics 通过 deployments 获取
-                const deploymentsRes = await cfGet(`/accounts/${accountId}/pages/projects/${project.name}/deployments`, email, apikey);
-                if (deploymentsRes.success && deploymentsRes.result) {
-                  for (const deployment of deploymentsRes.result) {
-                    if (deployment.deployment_trigger?.metadata?.analytics) {
-                      // 累积 Pages 请求
-                    }
-                  }
-                }
-              } catch (e) {}
-            }
-          }
-        } catch (e) {}
-        
-      } catch (e) {
-        console.error('REST API error:', e);
-      }
-    }
-    
-    const totalRequests = workersRequests + pagesRequests;
-    const percentage = Math.min(100, (totalRequests / 100000) * 100);
-    
-    return json({ 
-      success: true, 
-      data: { 
-        total: totalRequests, 
-        workers: workersRequests, 
-        pages: pagesRequests, 
-        percentage: percentage,
-        start: start,
-        end: end
-      } 
-    }); 
-  } catch(e) { 
-    return json({ 
-      success: true, 
-      data: { total: 0, workers: 0, pages: 0, percentage: 0, error: e.message } 
-    }); 
-  } 
-}
       
       case 'list-kv-namespaces': 
         return json(await cfGet(`/accounts/${payload.accountId}/storage/kv/namespaces`, payload.email, payload.key));
