@@ -377,6 +377,29 @@ async function handleAPI(req, env) {
     }
     return json({ success: true, account: null });
   }
+  // 在 handleAPI 函数中，添加 validate-credentials 处理
+// 放在账号管理相关 actions 之后
+
+// ========== 验证 Cloudflare 账号有效性 ==========
+if (action === 'validate-credentials') {
+  const { email, key } = payload;
+  if (!email || !key) {
+    return json({ success: false, error: '缺少邮箱或 API Key' }, 400);
+  }
+  try {
+    const testResult = await cfAny('GET', '/accounts', email, key);
+    if (testResult.success && testResult.result && testResult.result.length > 0) {
+      return json({ success: true, message: '凭据有效', accountId: testResult.result[0].id });
+    } else {
+      return json({ 
+        success: false, 
+        error: testResult.errors?.[0]?.message || '凭据无效'
+      });
+    }
+  } catch (e) {
+    return json({ success: false, error: e.message });
+  }
+}
   
   // 登出
   if (action === 'logout') {
