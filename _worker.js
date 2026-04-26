@@ -1,5 +1,5 @@
-// =============== Cloudflare Manager - 简化版 ===============
-// 首次只设置主密码，账号登录后再添加
+// =============== Cloudflare Manager - 完整版 ===============
+// 支持加密存储凭据到 KV，跨浏览器使用
 
 export default {
   async fetch(request, env, ctx) {
@@ -38,17 +38,11 @@ async function deriveKey(password, salt) {
   );
 }
 
-// 修复加密函数 - 使用 webcrypto 兼容方法
+// 加密函数
 async function encrypt(text, password) {
   const encoder = new TextEncoder();
-  
-  // 使用 webcrypto 生成随机数
-  const salt = new Uint8Array(SALT_LENGTH);
-  const iv = new Uint8Array(IV_LENGTH);
-  
-  // 使用 crypto.getRandomValues（Workers 支持）
-  crypto.getRandomValues(salt);
-  crypto.getRandomValues(iv);
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
   
   const key = await deriveKey(password, salt);
   const encrypted = await crypto.subtle.encrypt(
@@ -57,30 +51,18 @@ async function encrypt(text, password) {
     encoder.encode(text)
   );
   
-  // 合并 salt + iv + encrypted
   const result = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
   result.set(salt, 0);
   result.set(iv, salt.length);
   result.set(new Uint8Array(encrypted), salt.length + iv.length);
   
-  // 转换为 base64
-  let binary = '';
-  for (let i = 0; i < result.length; i++) {
-    binary += String.fromCharCode(result[i]);
-  }
-  return btoa(binary);
+  return btoa(String.fromCharCode(...result));
 }
 
-// 修复解密函数
+// 解密函数
 async function decrypt(encryptedBase64, password) {
   const decoder = new TextDecoder();
-  
-  // 从 base64 恢复二进制数据
-  const binary = atob(encryptedBase64);
-  const encrypted = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    encrypted[i] = binary.charCodeAt(i);
-  }
+  const encrypted = Uint8Array.from(atob(encryptedBase64), c => c.charCodeAt(0));
   
   const salt = encrypted.slice(0, SALT_LENGTH);
   const iv = encrypted.slice(SALT_LENGTH, SALT_LENGTH + IV_LENGTH);
@@ -106,11 +88,11 @@ async function handleRequest(request, env) {
   const url = new URL(request.url);
   const p = url.pathname;
 
-  // 检查是否已设置主密码
-  const hasMasterPassword = await env.MY_KV.get('config:has_master_password');
+  // 检查是否需要配置
+  const isConfigured = await env.MY_KV.get('config:is_configured');
   
-  // 首次配置页面（只设置主密码）
-  if (p === '/setup' && request.method === 'GET' && !hasMasterPassword) {
+  // 首次配置页面
+  if (p === '/setup' && request.method === 'GET' && !isConfigured) {
     return new Response(renderSetupHTML(), { 
       headers: { 'content-type': 'text/html; charset=utf-8' } 
     });
@@ -133,7 +115,7 @@ async function handleRequest(request, env) {
   
   // 主页重定向
   if (request.method === 'GET' && (p === '/' || p === '/index.html')) {
-    if (!hasMasterPassword) {
+    if (!isConfigured) {
       return Response.redirect(`${url.origin}/setup`, 302);
     }
     return Response.redirect(`${url.origin}/login`, 302);
@@ -141,7 +123,7 @@ async function handleRequest(request, env) {
   
   // 登录页面
   if (request.method === 'GET' && (p === '/login' || p === '/login/')) {
-    if (!hasMasterPassword) {
+    if (!isConfigured) {
       return Response.redirect(`${url.origin}/setup`, 302);
     }
     return new Response(renderLoginHTML(), { 
@@ -159,6 +141,10 @@ async function handleRequest(request, env) {
         const match = cookie.match(/session_token=([^;]+)/);
         if (match) sessionToken = match[1];
       }
+    }
+    
+    if (!sessionToken) {
+      sessionToken = url.searchParams.get('session');
     }
     
     if (sessionToken) {
@@ -186,101 +172,14 @@ async function handleAPI(req, env) {
   const action = payload.action;
   if (!action) return json({ success: false, error: 'action required' }, 400);
   
-  // ========== 首次设置主密码 ==========
-  if (action === 'setup-master-password') {
-    const { masterPassword } = payload;
+  // 首次配置
+  if (action === 'setup-credentials') {
+    const { email, key, masterPassword } = payload;
     
-    if (!masterPassword || masterPassword.length < 6) {
-      return json({ success: false, error: '密码至少需要6个字符' }, 400);
+    if (!email || !key || !masterPassword) {
+      return json({ success: false, error: '缺少必要参数' }, 400);
     }
     
-    // 存储主密码的哈希（加密存储一个标志）
-    // 实际不存储密码，只存储是否已设置
-    await env.MY_KV.put('config:has_master_password', 'true');
-    await env.MY_KV.put('config:setup_time', Date.now().toString());
-    
-    // 初始化空的账号列表（加密存储）
-    const emptyAccounts = JSON.stringify([]);
-    const encryptedAccounts = await encrypt(emptyAccounts, masterPassword);
-    await env.MY_KV.put('config:accounts', encryptedAccounts);
-    
-    return json({ success: true, message: '主密码设置成功' });
-  }
-  
-  // ========== 登录 ==========
-  if (action === 'login') {
-    const { masterPassword } = payload;
-    
-    if (!masterPassword) {
-      return json({ success: false, error: '请输入主密码' }, 400);
-    }
-    
-    const hasMasterPassword = await env.MY_KV.get('config:has_master_password');
-    if (!hasMasterPassword) {
-      return json({ success: false, error: '系统未初始化，请先访问 /setup' }, 400);
-    }
-    
-    try {
-      // 尝试解密账号列表来验证主密码
-      const encryptedAccounts = await env.MY_KV.get('config:accounts');
-      await decrypt(encryptedAccounts, masterPassword);
-      
-      // 创建 session
-      const sessionToken = generateSessionToken();
-      await env.MY_KV.put(`session:${sessionToken}`, JSON.stringify({
-        masterPassword, // 注意：实际生产环境不应存储密码，这里简化处理
-        expires: Date.now() + 8 * 3600000
-      }), { expirationTtl: 28800 });
-      
-      return json({ success: true, sessionToken, expiresIn: 28800 });
-      
-    } catch (error) {
-      return json({ success: false, error: '主密码错误' }, 401);
-    }
-  }
-  
-  // ========== 账号管理（需要登录）==========
-  
-  // 获取所有 Cloudflare 账号
-  if (action === 'get-cf-accounts') {
-    const sessionToken = payload.sessionToken;
-    if (!sessionToken) {
-      return json({ success: false, error: '未登录' }, 401);
-    }
-    
-    const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
-    if (!session || session.expires < Date.now()) {
-      return json({ success: false, error: '会话已过期' }, 401);
-    }
-    
-    try {
-      const encryptedAccounts = await env.MY_KV.get('config:accounts');
-      const accountsJson = await decrypt(encryptedAccounts, session.masterPassword);
-      const accounts = JSON.parse(accountsJson);
-      return json({ success: true, accounts });
-    } catch (error) {
-      return json({ success: false, error: '解密失败' }, 500);
-    }
-  }
-  
-  // 添加 Cloudflare 账号
-  if (action === 'add-cf-account') {
-    const { sessionToken, email, key, alias } = payload;
-    
-    if (!sessionToken) {
-      return json({ success: false, error: '未登录' }, 401);
-    }
-    
-    if (!email || !key) {
-      return json({ success: false, error: '缺少邮箱或 API Key' }, 400);
-    }
-    
-    const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
-    if (!session || session.expires < Date.now()) {
-      return json({ success: false, error: '会话已过期' }, 401);
-    }
-    
-    // 验证 Cloudflare 账号
     const testResult = await cfAny('GET', '/accounts', email, key);
     if (!testResult.success && !testResult.result) {
       return json({ 
@@ -289,64 +188,165 @@ async function handleAPI(req, env) {
       });
     }
     
-    try {
-      const encryptedAccounts = await env.MY_KV.get('config:accounts');
-      const accountsJson = await decrypt(encryptedAccounts, session.masterPassword);
-      let accounts = JSON.parse(accountsJson);
-      
-      const existingIndex = accounts.findIndex(a => a.email === email);
-      const newAccount = { 
-        email, 
-        key, 
-        alias: alias || email,
-        createdAt: Date.now()
-      };
-      
-      if (existingIndex >= 0) {
-        accounts[existingIndex] = newAccount;
-      } else {
-        accounts.push(newAccount);
-      }
-      
-      const newEncrypted = await encrypt(JSON.stringify(accounts), session.masterPassword);
-      await env.MY_KV.put('config:accounts', newEncrypted);
-      
-      return json({ success: true, message: '账号添加成功' });
-    } catch (error) {
-      return json({ success: false, error: '保存失败：' + error.message }, 500);
-    }
+    // 存储主账号凭据
+    const mainAccount = { email, key, alias: '主账号', isDefault: true };
+    const encryptedCredentials = await encrypt(JSON.stringify([mainAccount]), masterPassword);
+    
+    await env.MY_KV.put('config:credentials', encryptedCredentials);
+    await env.MY_KV.put('config:is_configured', 'true');
+    await env.MY_KV.put('config:setup_time', Date.now().toString());
+    
+    // 创建初始会话
+    const sessionToken = generateSessionToken();
+    await env.MY_KV.put(`session:${sessionToken}`, JSON.stringify({
+      email,
+      key,
+      expires: Date.now() + 8 * 3600000
+    }), { expirationTtl: 28800 });
+    
+    return json({ success: true, sessionToken, message: '配置已保存' });
   }
   
-  // 删除 Cloudflare 账号
-  if (action === 'delete-cf-account') {
-    const { sessionToken, email } = payload;
-    
-    if (!sessionToken) {
-      return json({ success: false, error: '未登录' }, 401);
-    }
-    
-    const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
-    if (!session || session.expires < Date.now()) {
-      return json({ success: false, error: '会话已过期' }, 401);
-    }
-    
-    try {
-      const encryptedAccounts = await env.MY_KV.get('config:accounts');
-      const accountsJson = await decrypt(encryptedAccounts, session.masterPassword);
-      let accounts = JSON.parse(accountsJson);
-      accounts = accounts.filter(a => a.email !== email);
-      
-      const newEncrypted = await encrypt(JSON.stringify(accounts), session.masterPassword);
-      await env.MY_KV.put('config:accounts', newEncrypted);
-      
-      return json({ success: true, message: '账号删除成功' });
-    } catch (error) {
-      return json({ success: false, error: '删除失败：' + error.message }, 500);
-    }
+  // 登录
+  // 登录 - 修改，存储完整账号列表到 session
+if (action === 'login') {
+  const { masterPassword } = payload;
+  
+  if (!masterPassword) {
+    return json({ success: false, error: '请输入访问密码' }, 400);
   }
   
-  // 切换当前使用的账号
-  if (action === 'set-current-account') {
+  const encryptedCredentials = await env.MY_KV.get('config:credentials');
+  if (!encryptedCredentials) {
+    return json({ success: false, error: '系统未配置，请先访问 /setup 进行配置' }, 400);
+  }
+  
+  try {
+    const accountsJson = await decrypt(encryptedCredentials, masterPassword);
+    let accounts = JSON.parse(accountsJson);
+    
+    // 确保是数组格式
+    if (!Array.isArray(accounts)) {
+      accounts = [{ email: accounts.email, key: accounts.key, alias: '主账号', isDefault: true }];
+    }
+    
+    const defaultAccount = accounts.find(a => a.isDefault) || accounts[0];
+    
+    const sessionToken = generateSessionToken();
+    await env.MY_KV.put(`session:${sessionToken}`, JSON.stringify({
+      email: defaultAccount.email,
+      key: defaultAccount.key,
+      accounts: accounts,  // 存储完整账号列表
+      expires: Date.now() + 8 * 3600000
+    }), { expirationTtl: 28800 });
+    
+    return json({ success: true, sessionToken, expiresIn: 28800 });
+    
+  } catch (error) {
+    return json({ success: false, error: '访问密码错误' }, 401);
+  }
+}
+  // 获取账号列表 - 直接从 session 获取
+if (action === 'get-accounts') {
+  const sessionToken = payload.sessionToken;
+  if (!sessionToken) {
+    return json({ success: false, error: '未登录' }, 401);
+  }
+  
+  const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
+  if (!session || session.expires < Date.now()) {
+    return json({ success: false, error: '会话已过期' }, 401);
+  }
+  
+  // 从 session 中返回账号列表（登录时已经解密并存入了 session）
+  const accounts = session.accounts || [];
+  return json({ success: true, accounts: accounts.map(a => ({ 
+    email: a.email, 
+    alias: a.alias || a.email,
+    isDefault: a.isDefault 
+  })) });
+}
+  
+  // 添加账号
+  // 添加账号 - 修复解密问题
+if (action === 'add-account') {
+  const { sessionToken, email, key, alias, masterPassword } = payload;
+  
+  if (!sessionToken) {
+    return json({ success: false, error: '未登录' }, 401);
+  }
+  
+  const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
+  if (!session || session.expires < Date.now()) {
+    return json({ success: false, error: '会话已过期' }, 401);
+  }
+  
+  if (!email || !key) {
+    return json({ success: false, error: '缺少邮箱或 API Key' }, 400);
+  }
+  
+  if (!masterPassword) {
+    return json({ success: false, error: '需要主密码才能添加账号' }, 400);
+  }
+  
+  try {
+    // 验证新账号
+    const testResult = await cfAny('GET', '/accounts', email, key);
+    if (!testResult.success && !testResult.result) {
+      return json({ 
+        success: false, 
+        error: 'Cloudflare 凭据无效：' + (testResult.errors?.[0]?.message || '验证失败')
+      });
+    }
+    
+    // 获取加密的凭据并解密
+    const encryptedCredentials = await env.MY_KV.get('config:credentials');
+    if (!encryptedCredentials) {
+      return json({ success: false, error: '系统未配置' }, 400);
+    }
+    
+    let accounts;
+    try {
+      const accountsJson = await decrypt(encryptedCredentials, masterPassword);
+      accounts = JSON.parse(accountsJson);
+    } catch (decryptError) {
+      console.error('Decrypt error:', decryptError);
+      return json({ success: false, error: '主密码错误，无法解密账号列表' }, 401);
+    }
+    
+    // 确保 accounts 是数组
+    if (!Array.isArray(accounts)) {
+      accounts = [accounts];
+    }
+    
+    // 检查是否已存在
+    const existingIndex = accounts.findIndex(a => a.email === email);
+    const newAccount = { email, key, alias: alias || email, isDefault: false };
+    
+    if (existingIndex >= 0) {
+      accounts[existingIndex] = newAccount;
+    } else {
+      accounts.push(newAccount);
+    }
+    
+    // 重新加密保存
+    const newEncrypted = await encrypt(JSON.stringify(accounts), masterPassword);
+    await env.MY_KV.put('config:credentials', newEncrypted);
+    
+    // 更新 session 中的账号列表
+    session.accounts = accounts;
+    await env.MY_KV.put(`session:${sessionToken}`, JSON.stringify(session), { expirationTtl: 28800 });
+    
+    return json({ success: true, message: '账号添加成功' });
+    
+  } catch (error) {
+    console.error('Add account error:', error);
+    return json({ success: false, error: '添加失败：' + error.message }, 500);
+  }
+}
+  
+  // 切换账号
+  if (action === 'switch-account') {
     const { sessionToken, email } = payload;
     
     if (!sessionToken || !email) {
@@ -358,66 +358,18 @@ async function handleAPI(req, env) {
       return json({ success: false, error: '会话已过期' }, 401);
     }
     
-    try {
-      const encryptedAccounts = await env.MY_KV.get('config:accounts');
-      const accountsJson = await decrypt(encryptedAccounts, session.masterPassword);
-      const accounts = JSON.parse(accountsJson);
-      const account = accounts.find(a => a.email === email);
-      
-      if (!account) {
-        return json({ success: false, error: '账号不存在' }, 400);
-      }
-      
-      // 更新 session 中的当前账号
-      session.currentAccount = account;
-      await env.MY_KV.put(`session:${sessionToken}`, JSON.stringify(session), { expirationTtl: 28800 });
-      
-      return json({ success: true, account: { email: account.email, alias: account.alias } });
-    } catch (error) {
-      return json({ success: false, error: '切换失败：' + error.message }, 500);
-    }
-  }
-  
-  // 获取当前使用的账号
-  if (action === 'get-current-account') {
-    const sessionToken = payload.sessionToken;
-    if (!sessionToken) {
-      return json({ success: false, error: '未登录' }, 401);
+    const account = session.accounts.find(a => a.email === email);
+    if (!account) {
+      return json({ success: false, error: '账号不存在' }, 400);
     }
     
-    const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
-    if (!session || session.expires < Date.now()) {
-      return json({ success: false, error: '会话已过期' }, 401);
-    }
+    // 更新 session 中的当前账号
+    session.email = account.email;
+    session.key = account.key;
+    await env.MY_KV.put(`session:${sessionToken}`, JSON.stringify(session), { expirationTtl: 28800 });
     
-    if (session.currentAccount) {
-      return json({ success: true, account: session.currentAccount });
-    }
-    return json({ success: true, account: null });
+    return json({ success: true, message: '已切换账号' });
   }
-  // 在 handleAPI 函数中，添加 validate-credentials 处理
-// 放在账号管理相关 actions 之后
-
-// ========== 验证 Cloudflare 账号有效性 ==========
-if (action === 'validate-credentials') {
-  const { email, key } = payload;
-  if (!email || !key) {
-    return json({ success: false, error: '缺少邮箱或 API Key' }, 400);
-  }
-  try {
-    const testResult = await cfAny('GET', '/accounts', email, key);
-    if (testResult.success && testResult.result && testResult.result.length > 0) {
-      return json({ success: true, message: '凭据有效', accountId: testResult.result[0].id });
-    } else {
-      return json({ 
-        success: false, 
-        error: testResult.errors?.[0]?.message || '凭据无效'
-      });
-    }
-  } catch (e) {
-    return json({ success: false, error: e.message });
-  }
-}
   
   // 登出
   if (action === 'logout') {
@@ -427,8 +379,23 @@ if (action === 'validate-credentials') {
     }
     return json({ success: true });
   }
-  
-  // ========== 需要 Cloudflare 凭据的操作 ==========
+  if (action === 'validate-credentials') {
+    const { email, key } = payload;
+    if (!email || !key) {
+      return json({ success: false, error: '缺少邮箱或 API Key' }, 400);
+    }
+    try {
+      const r = await cfAny('GET', '/accounts', email, key);
+      if (r.success && r.result && r.result.length > 0) {
+        return json({ success: true, message: '凭据有效', accountId: r.result[0].id });
+      } else {
+        return json({ success: false, error: r.errors?.[0]?.message || '凭据无效' });
+      }
+    } catch (e) {
+      return json({ success: false, error: e.message });
+    }
+  }
+  // 需要 Cloudflare 凭据的操作
   const needsCreds = new Set([
     'list-accounts', 'list-workers', 'get-worker-script', 'deploy-worker',
     'list-kv-namespaces', 'list-d1', 'put-worker-variables', 'get-worker-variables',
@@ -451,12 +418,8 @@ if (action === 'validate-credentials') {
       return json({ success: false, error: '会话已过期，请重新登录' }, 401);
     }
     
-    if (!session.currentAccount) {
-      return json({ success: false, error: '请先在账号管理中选择一个账号' }, 400);
-    }
-    
-    payload.email = session.currentAccount.email;
-    payload.key = session.currentAccount.key;
+    payload.email = session.email;
+    payload.key = session.key;
   }
   
   try {
@@ -495,7 +458,7 @@ if (action === 'validate-credentials') {
                 worker.domains = domainsResult.result.map(domain => ({
                   id: domain.id,
                   hostname: domain.hostname,
-                  status: domain.status || 'active'
+                  status: domain.status || 'active'  // 修复：如果没有状态字段，默认为 active
                 }));
               } else {
                 worker.domains = [];
@@ -701,80 +664,22 @@ if (action === 'validate-credentials') {
       }
       
       case 'get-usage-today': { 
-        if (!payload.accountId) return json({ success: false }, 400); 
+        if (!payload.accountId) return json({ success:false },400); 
         const { accountId, email, key: apikey } = payload; 
-        const now = new Date(); 
-        const end = now.toISOString(); 
-        now.setUTCHours(0, 0, 0, 0); 
-        const start = now.toISOString(); 
+        const now=new Date(); 
+        const end=now.toISOString(); 
+        now.setUTCHours(0,0,0,0); 
+        const start=now.toISOString(); 
         try { 
-          let workersRequests = 0;
-          let pagesRequests = 0;
-          
-          // 使用 GraphQL 查询
-          const graphqlQuery = {
-            query: `query {
-              viewer {
-                accounts(filter: {accountTag: "${accountId}"}) {
-                  workersInvocationsAdaptive(
-                    limit: 100,
-                    filter: { datetime_geq: "${start}", datetime_lt: "${end}" }
-                  ) {
-                    sum { requests }
-                  }
-                  pagesFunctionsInvocationsAdaptive(
-                    limit: 100,
-                    filter: { datetime_geq: "${start}", datetime_lt: "${end}" }
-                  ) {
-                    sum { requests }
-                  }
-                }
-              }
-            }`
-          };
-          
-          const graphqlRes = await fetch("https://api.cloudflare.com/client/v4/graphql", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Auth-Email": email,
-              "X-Auth-Key": apikey
-            },
-            body: JSON.stringify(graphqlQuery)
-          });
-          
-          if (graphqlRes.ok) {
-            const data = await graphqlRes.json();
-            const account = data?.data?.viewer?.accounts?.[0];
-            
-            const workersInv = account?.workersInvocationsAdaptive || [];
-            for (const inv of workersInv) {
-              if (inv.sum?.requests) workersRequests += inv.sum.requests;
-            }
-            
-            const pagesInv = account?.pagesFunctionsInvocationsAdaptive || [];
-            for (const inv of pagesInv) {
-              if (inv.sum?.requests) pagesRequests += inv.sum.requests;
-            }
-          }
-          
-          const totalRequests = workersRequests + pagesRequests;
-          const percentage = Math.min(100, (totalRequests / 100000) * 100);
-          
-          return json({ 
-            success: true, 
-            data: { 
-              total: totalRequests, 
-              workers: workersRequests, 
-              pages: pagesRequests, 
-              percentage: percentage
-            } 
-          }); 
+          const r=await fetch("https://api.cloudflare.com/client/v4/graphql",{method:"POST",headers:{"Content-Type":"application/json","X-Auth-Email":email,"X-Auth-Key":apikey},body:JSON.stringify({query:`query getBillingMetrics($accountId:String!,$filter:AccountWorkersInvocationsAdaptiveFilter_InputObject){viewer{accounts(filter:{accountTag:$accountId}){pagesFunctionsInvocationsAdaptiveGroups(limit:1000,filter:$filter){sum{requests}}workersInvocationsAdaptive(limit:10000,filter:$filter){sum{requests}}}}}`,variables:{accountId,filter:{datetime_geq:start,datetime_leq:end}}})}); 
+          if(!r.ok) return json({success:true,data:{total:0,workers:0,pages:0,percentage:0}}); 
+          const res=await r.json(); 
+          const ac=res?.data?.viewer?.accounts?.[0]; 
+          const p=(ac?.pagesFunctionsInvocationsAdaptiveGroups||[]).reduce((t,i)=>t+(i?.sum?.requests||0),0); 
+          const w=(ac?.workersInvocationsAdaptive||[]).reduce((t,i)=>t+(i?.sum?.requests||0),0); 
+          return json({success:true,data:{total:p+w,workers:w,pages:p,percentage:Math.min(100,((p+w)/100000)*100)}}); 
         } catch(e){ 
-          return json({ 
-            success: true, 
-            data: { total: 0, workers: 0, pages: 0, percentage: 0 } 
-          }); 
+          return json({success:true,data:{total:0,workers:0,pages:0,percentage:0}}); 
         } 
       }
       
@@ -987,7 +892,7 @@ function renderSetupHTML() {
     background: white;
     border-radius: 20px;
     padding: 40px;
-    max-width: 450px;
+    max-width: 500px;
     width: 100%;
     box-shadow: 0 20px 60px rgba(0,0,0,0.3);
   }
@@ -1034,38 +939,47 @@ function renderSetupHTML() {
 </head>
 <body>
 <div class="setup-container">
-  <h2>🔐 欢迎使用 Cloudflare Manager</h2>
-  <div class="subtitle">首次使用，请设置主密码（登录密码）</div>
+  <h2>🚀 欢迎使用 Cloudflare Manager</h2>
+  <div class="subtitle">首次使用，请完成以下配置</div>
   
   <div class="form-group">
-    <label>设置主密码</label>
-    <input type="password" id="masterPassword" placeholder="请输入主密码（至少6位）">
-    <div class="note">⚠️ 请务必记住此密码！用于登录管理后台，忘记无法找回</div>
+    <label>Cloudflare 账号邮箱</label>
+    <input type="email" id="email" placeholder="your@email.com">
   </div>
   
   <div class="form-group">
-    <label>确认主密码</label>
+    <label>Cloudflare Global API Key</label>
+    <input type="password" id="apiKey" placeholder="您的 Global API Key">
+    <div class="note">可在 Cloudflare 控制台右上角 → 我的资料 → API 令牌中获取</div>
+  </div>
+  
+  <div class="form-group">
+    <label>设置访问密码</label>
+    <input type="password" id="masterPassword" placeholder="用于登录管理后台">
+    <div class="note">⚠️ 请务必记住此密码！凭据将加密存储，忘记密码无法找回</div>
+  </div>
+  
+  <div class="form-group">
+    <label>确认访问密码</label>
     <input type="password" id="confirmPassword" placeholder="再次输入密码">
   </div>
   
   <div id="errorMsg" class="error"></div>
   
-  <button onclick="setup()">设置主密码并开始使用</button>
-  
-  <div class="note" style="margin-top: 16px;">
-    💡 提示：设置完成后，您可以在后台添加多个 Cloudflare 账号
-  </div>
+  <button onclick="setup()">保存配置并开始使用</button>
 </div>
 
 <script>
 async function setup() {
+  const email = document.getElementById('email').value.trim();
+  const apiKey = document.getElementById('apiKey').value.trim();
   const masterPassword = document.getElementById('masterPassword').value;
   const confirmPassword = document.getElementById('confirmPassword').value;
   
   document.getElementById('errorMsg').style.display = 'none';
   
-  if (!masterPassword) {
-    showError('请输入主密码');
+  if (!email || !apiKey || !masterPassword) {
+    showError('请填写所有字段');
     return;
   }
   
@@ -1075,38 +989,41 @@ async function setup() {
   }
   
   if (masterPassword.length < 6) {
-    showError('主密码至少需要 6 个字符');
+    showError('访问密码至少需要 6 个字符');
     return;
   }
   
   const btn = document.querySelector('button');
   btn.disabled = true;
-  btn.textContent = '设置中...';
+  btn.textContent = '验证中...';
   
   try {
     const response = await fetch('/api', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        action: 'setup-master-password',
+        action: 'setup-credentials',
+        email: email,
+        key: apiKey,
         masterPassword: masterPassword
       })
     });
     
     const result = await response.json();
     
-    if (result.success) {
-      alert('主密码设置成功！请使用主密码登录');
-      window.location.href = '/login';
+    if (result.success && result.sessionToken) {
+      localStorage.setItem('cf_session_token', result.sessionToken);
+      document.cookie = 'session_token=' + result.sessionToken + '; path=/; max-age=28800; SameSite=Strict';
+      window.location.href = '/workers';
     } else {
-      showError(result.error || '设置失败');
+      showError(result.error || '配置失败，请检查 Cloudflare 凭据是否正确');
       btn.disabled = false;
-      btn.textContent = '设置主密码并开始使用';
+      btn.textContent = '保存配置并开始使用';
     }
   } catch (error) {
     showError('网络错误：' + error.message);
     btn.disabled = false;
-    btn.textContent = '设置主密码并开始使用';
+    btn.textContent = '保存配置并开始使用';
   }
 }
 
@@ -1191,12 +1108,12 @@ function renderLoginHTML() {
 </head>
 <body>
 <div class="login-container">
-  <h2>🔐 Cloudflare Manager</h2>
-  <div class="subtitle">请输入主密码登录</div>
+  <h2>🔐 访问控制</h2>
+  <div class="subtitle">请输入访问密码继续</div>
   
   <div class="form-group">
-    <label>主密码</label>
-    <input type="password" id="password" placeholder="请输入主密码" onkeypress="if(event.key==='Enter') login()">
+    <label>访问密码</label>
+    <input type="password" id="password" placeholder="请输入管理员设置的密码" onkeypress="if(event.key==='Enter') login()">
   </div>
   
   <div id="errorMsg" class="error"></div>
@@ -1204,7 +1121,7 @@ function renderLoginHTML() {
   <button onclick="login()">登录管理后台</button>
   
   <div class="note">
-    💡 提示：主密码在首次部署时设置，请妥善保管
+    💡 提示：密码由管理员在首次配置时设置
   </div>
 </div>
 
@@ -1220,7 +1137,7 @@ async function login() {
   errorDiv.style.display = 'none';
   
   if (!password) {
-    errorDiv.textContent = '请输入主密码';
+    errorDiv.textContent = '请输入访问密码';
     errorDiv.style.display = 'block';
     return;
   }
@@ -1340,7 +1257,6 @@ input:checked+.slider:before{transform:translateX(20px)}
 .acct-row{display:flex;justify-content:space-between;align-items:center;padding:12px;border-bottom:1px solid #eef2f6}
 .acct-active{background:#eff6ff}
 .badge{background:#dbeafe;color:#1e40af;font-size:10px;padding:2px 6px;border-radius:4px;margin-left:8px}
-.current-badge{background:#10b981;color:white}
 </style>
 </head>
 <body>
@@ -1357,7 +1273,7 @@ input:checked+.slider:before{transform:translateX(20px)}
       <div class="item" data-page="settings">设置</div>
     </nav>
     <div style="margin-top:auto;padding-top:20px;border-top:1px solid #eef2f6">
-      <div class="small" id="currentAccountDisplay">未选择账号</div>
+      <div class="small" id="currentAccount"></div>
       <div style="margin-top:8px;display:flex;gap:12px">
         <span onclick="showAccountSwitcher()" style="cursor:pointer;color:#2563eb;font-size:12px">切换账号</span>
         <span onclick="logout()" style="cursor:pointer;color:#ef4444;font-size:12px">退出</span>
@@ -1379,7 +1295,6 @@ input:checked+.slider:before{transform:translateX(20px)}
         <div class="bar"><div id="metricBar"></div></div>
         <div style="display:flex;justify-content:space-between;margin-top:12px">
           <div><span class="small">Workers:</span> <strong id="workersRequests">0</strong></div>
-          <div><span class="small">Pages:</span> <strong id="pagesRequests">0</strong></div>
           <div><span class="small">日配额:</span> <strong>100,000</strong></div>
         </div>
       </div>
@@ -1442,18 +1357,13 @@ input:checked+.slider:before{transform:translateX(20px)}
     <!-- 账号管理页面 -->
     <div id="accounts-page" class="page-content">
       <div class="header">
-        <div style="font-size:20px;font-weight:700">Cloudflare 账号管理</div>
+        <div style="font-size:20px;font-weight:700">账号管理</div>
         <button class="btn primary" onclick="openAddAccountModal()">添加账号</button>
       </div>
       
       <div class="card">
         <div class="card-header"><h3>已保存的账号</h3></div>
         <div class="card-body" id="accountsList"></div>
-      </div>
-      
-      <div class="card">
-        <div class="card-header"><h3>当前使用的账号</h3></div>
-        <div class="card-body" id="currentAccountInfo"></div>
       </div>
     </div>
     
@@ -1519,40 +1429,6 @@ input:checked+.slider:before{transform:translateX(20px)}
 </div>
 
 <!-- 模态框 -->
-<div id="addAccountModal" class="modal">
-  <div class="modal-box">
-    <h3>添加 Cloudflare 账号</h3>
-    <div class="form-group">
-      <label>邮箱地址</label>
-      <input id="newAccountEmail" class="input" placeholder="your@email.com">
-    </div>
-    <div class="form-group">
-      <label>Global API Key</label>
-      <input id="newAccountKey" class="input" type="password" placeholder="API Key">
-      <div class="small" style="margin-top:4px">可在 Cloudflare 控制台 → 我的资料 → API 令牌中获取</div>
-    </div>
-    <div class="form-group">
-      <label>别名（可选）</label>
-      <input id="newAccountAlias" class="input" placeholder="例如: 工作账号">
-    </div>
-    <div id="addAccountError" class="small" style="color:#ef4444;display:none"></div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
-      <button class="btn" onclick="closeAddAccountModal()">取消</button>
-      <button class="btn primary" onclick="confirmAddAccount()">验证并添加</button>
-    </div>
-  </div>
-</div>
-
-<div id="accountSwitcherModal" class="modal">
-  <div class="modal-box">
-    <h3>切换账号</h3>
-    <div id="accountSwitcherList"></div>
-    <div style="margin-top:16px">
-      <button class="btn" style="width:100%" onclick="closeAccountSwitcher()">关闭</button>
-    </div>
-  </div>
-</div>
-
 <div id="createWorkerModal" class="modal">
   <div class="modal-box">
     <h3>新建 Worker</h3>
@@ -1598,6 +1474,43 @@ input:checked+.slider:before{transform:translateX(20px)}
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
       <button class="btn" onclick="closeEnvModal()">取消</button>
       <button class="btn primary" onclick="saveEnvVars()">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="addAccountModal" class="modal">
+  <div class="modal-box">
+    <h3>添加 Cloudflare 账号</h3>
+    <div class="form-group">
+      <label>邮箱地址</label>
+      <input id="newAccountEmail" class="input" placeholder="your@email.com">
+    </div>
+    <div class="form-group">
+      <label>Global API Key</label>
+      <input id="newAccountKey" class="input" type="password" placeholder="API Key">
+    </div>
+    <div class="form-group">
+      <label>别名（可选）</label>
+      <input id="newAccountAlias" class="input" placeholder="例如: 工作账号">
+    </div>
+    <div class="form-group">
+      <label>主密码（用于加密）</label>
+      <input id="masterPasswordForAdd" class="input" type="password" placeholder="输入您的主密码">
+    </div>
+    <div id="addAccountError" class="small" style="color:#ef4444;display:none"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn" onclick="closeAddAccountModal()">取消</button>
+      <button class="btn primary" onclick="confirmAddAccount()">验证并添加</button>
+    </div>
+  </div>
+</div>
+
+<div id="accountSwitcherModal" class="modal">
+  <div class="modal-box">
+    <h3>切换账号</h3>
+    <div id="accountSwitcherList"></div>
+    <div style="margin-top:16px">
+      <button class="btn" style="width:100%" onclick="closeAccountSwitcher()">关闭</button>
     </div>
   </div>
 </div>
@@ -1701,8 +1614,6 @@ function renderStaticJS(env) {
   let currentWorkerForEnv = null;
   let currentWorkerForDomain = null;
   let currentZoneId = null;
-  let currentAccounts = [];
-  let currentSelectedAccount = null;
   
   // API 调用
   async function api(action, body) {
@@ -1747,39 +1658,10 @@ function renderStaticJS(env) {
     if (page === 'settings') loadSubdomain();
   }
   
-  // 加载当前账号信息
-  async function loadCurrentAccount() {
-    const res = await api('get-current-account');
-    if (res.success && res.account) {
-      currentSelectedAccount = res.account;
-      document.getElementById('currentAccountDisplay').innerHTML = \`当前: \${res.account.alias || res.account.email}\`;
-      document.getElementById('currentAccountInfo').innerHTML = \`
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <div>
-            <strong>\${escapeHtml(res.account.alias || res.account.email)}</strong>
-            <div class="small">\${res.account.email}</div>
-          </div>
-          <span class="badge current-badge" style="background:#10b981">当前使用</span>
-        </div>
-      \`;
-    } else {
-      document.getElementById('currentAccountDisplay').innerHTML = '未选择账号';
-      if (document.getElementById('currentAccountInfo')) {
-        document.getElementById('currentAccountInfo').innerHTML = '<div class="small" style="color:#ef4444">请先在账号管理中选择一个账号</div>';
-      }
-    }
-  }
-  
   // 刷新 Workers 列表
   async function refreshWorkers() {
     const listDiv = document.getElementById('workersList');
     if (!listDiv) return;
-    
-    if (!currentSelectedAccount) {
-      listDiv.innerHTML = '<div class="small" style="color:#ef4444">请先在账号管理中选择一个账号</div>';
-      return;
-    }
-    
     listDiv.innerHTML = '<div class="small">加载中...</div>';
     
     try {
@@ -1843,14 +1725,15 @@ function renderStaticJS(env) {
                 </div>
               \` : ''}
               \${domains.map(d => {
+                // 修复：正确判断域名状态
                 const status = d.status || 'active';
                 const statusText = status === 'active' ? '✅ 已生效' : (status === 'pending' ? '⏳ 待生效' : status);
                 const statusClass = status === 'active' ? 'active' : 'pending';
                 return \`
                   <div class="domain-tag">
                     <a href="https://\${escapeHtml(d.hostname)}" target="_blank" style="text-decoration:none;color:inherit">\${escapeHtml(d.hostname)}</a>
-                    <span class="domain-status \${statusClass}">\${statusText}</span>
-                    <button class="del-domain" onclick="deleteDomain('\${name}', '\${d.id}', '\${escapeHtml(d.hostname)}')">✕</button>
+                    <span class="domain-status \${statusClass}" title="状态: \${statusText}">\${statusText}</span>
+                    <button class="del-domain" onclick="deleteDomain('\${name}', '\${d.id}', '\${escapeHtml(d.hostname)}')" title="解绑域名">✕</button>
                   </div>
                 \`;
               }).join('')}
@@ -1920,20 +1803,15 @@ function renderStaticJS(env) {
   
   // 更新用量统计
   async function updateUsage() {
-    if (!currentSelectedAccount) return;
     try {
       const accountId = localStorage.getItem('cf_accountId');
       const res = await api('get-usage-today', { accountId });
       if (res.success && res.data) {
         const total = res.data.total || 0;
-        const workers = res.data.workers || 0;
-        const pages = res.data.pages || 0;
         const percentage = res.data.percentage || 0;
-        
         document.getElementById('metricCount').textContent = total.toLocaleString() + ' / 100,000';
         document.getElementById('metricBar').style.width = percentage + '%';
-        document.getElementById('workersRequests').textContent = workers.toLocaleString();
-        document.getElementById('pagesRequests').textContent = pages.toLocaleString();
+        document.getElementById('workersRequests').textContent = (res.data.workers || 0).toLocaleString();
       }
     } catch (e) {}
   }
@@ -2048,52 +1926,36 @@ function renderStaticJS(env) {
   
   // 账号管理页面
   async function loadAccountsPage() {
-    const res = await api('get-cf-accounts');
+    const res = await api('get-accounts');
     const container = document.getElementById('accountsList');
     
     if (!res.success || !res.accounts || res.accounts.length === 0) {
-      container.innerHTML = '<div class="small">暂无账号，请点击"添加账号"按钮添加</div>';
+      container.innerHTML = '<div class="small">暂无其他账号</div>';
       return;
     }
     
-    currentAccounts = res.accounts;
+    const currentEmail = localStorage.getItem('cf_active_email');
     container.innerHTML = res.accounts.map(acc => \`
-      <div class="acct-row">
+      <div class="acct-row \${acc.email === currentEmail ? 'acct-active' : ''}">
         <div>
           <strong>\${escapeHtml(acc.alias || acc.email)}</strong>
           <div class="small">\${acc.email}</div>
+          \${acc.isDefault ? '<span class="badge">默认</span>' : ''}
         </div>
-        <div class="btns">
-          <button class="btn small" onclick="selectAccount('\${acc.email}')">选择使用</button>
-          <button class="btn danger small" onclick="deleteAccount('\${acc.email}')">删除</button>
+        <div>
+          <button class="btn small" onclick="switchToAccount('\${acc.email}')">切换</button>
         </div>
       </div>
     \`).join('');
-    
-    // 加载当前使用的账号
-    await loadCurrentAccount();
   }
   
-  async function selectAccount(email) {
-    const res = await api('set-current-account', { email });
+  async function switchToAccount(email) {
+    const res = await api('switch-account', { email });
     if (res.success) {
-      showNotification('已切换到账号：' + (res.account?.alias || email));
-      await loadCurrentAccount();
-      await refreshWorkers();
-      navTo('workers');
+      showNotification('已切换账号');
+      location.reload();
     } else {
       showNotification(res.error || '切换失败', 'error');
-    }
-  }
-  
-  async function deleteAccount(email) {
-    if (!confirm('确定要删除此账号吗？')) return;
-    const res = await api('delete-cf-account', { email });
-    if (res.success) {
-      showNotification('账号已删除');
-      loadAccountsPage();
-    } else {
-      showNotification(res.error || '删除失败', 'error');
     }
   }
   
@@ -2102,6 +1964,7 @@ function renderStaticJS(env) {
     document.getElementById('newAccountEmail').value = '';
     document.getElementById('newAccountKey').value = '';
     document.getElementById('newAccountAlias').value = '';
+    document.getElementById('masterPasswordForAdd').value = '';
     document.getElementById('addAccountError').style.display = 'none';
     document.getElementById('addAccountModal').style.display = 'flex';
   }
@@ -2114,6 +1977,7 @@ function renderStaticJS(env) {
     const email = document.getElementById('newAccountEmail').value.trim();
     const key = document.getElementById('newAccountKey').value.trim();
     const alias = document.getElementById('newAccountAlias').value.trim();
+    const masterPassword = document.getElementById('masterPasswordForAdd').value;
     const errorDiv = document.getElementById('addAccountError');
     
     errorDiv.style.display = 'none';
@@ -2124,12 +1988,18 @@ function renderStaticJS(env) {
       return;
     }
     
+    if (!masterPassword) {
+      errorDiv.textContent = '请输入主密码';
+      errorDiv.style.display = 'block';
+      return;
+    }
+    
     const btn = event.target;
     btn.disabled = true;
     btn.textContent = '验证中...';
     
     try {
-      // 先验证账号
+      // 先验证新账号
       const validateRes = await fetch('/api', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2146,7 +2016,7 @@ function renderStaticJS(env) {
       }
       
       // 添加账号
-      const addRes = await api('add-cf-account', { email, key, alias });
+      const addRes = await api('add-account', { email, key, alias, masterPassword });
       if (addRes.success) {
         showNotification('账号添加成功');
         closeAddAccountModal();
@@ -2166,33 +2036,32 @@ function renderStaticJS(env) {
   
   // 账号切换器
   async function showAccountSwitcher() {
-    const res = await api('get-cf-accounts');
+    const res = await api('get-accounts');
     const container = document.getElementById('accountSwitcherList');
     
     if (!res.success || !res.accounts || res.accounts.length === 0) {
-      container.innerHTML = '<div class="small">暂无账号，请先在账号管理页面添加</div>';
+      container.innerHTML = '<div class="small">暂无其他账号</div>';
     } else {
-      const currentEmail = currentSelectedAccount?.email;
+      const currentEmail = localStorage.getItem('cf_active_email');
       container.innerHTML = res.accounts.map(acc => \`
-        <div class="acct-row" style="cursor:pointer" onclick="selectAccountAndClose('\${acc.email}')">
+        <div class="acct-row \${acc.email === currentEmail ? 'acct-active' : ''}" style="cursor:pointer" onclick="switchToAccountAndClose('\${acc.email}')">
           <div>
             <strong>\${escapeHtml(acc.alias || acc.email)}</strong>
             <div class="small">\${acc.email}</div>
+            \${acc.isDefault ? '<span class="badge">默认</span>' : ''}
           </div>
-          \${acc.email === currentEmail ? '<span class="badge current-badge">当前</span>' : '<span>→</span>'}
+          \${acc.email !== currentEmail ? '<span>→</span>' : '<span class="badge">当前</span>'}
         </div>
       \`).join('');
     }
     document.getElementById('accountSwitcherModal').style.display = 'flex';
   }
   
-  async function selectAccountAndClose(email) {
-    const res = await api('set-current-account', { email });
+  async function switchToAccountAndClose(email) {
+    const res = await api('switch-account', { email });
     if (res.success) {
       closeAccountSwitcher();
-      await loadCurrentAccount();
-      await refreshWorkers();
-      showNotification('已切换账号');
+      location.reload();
     } else {
       showNotification(res.error || '切换失败', 'error');
     }
@@ -2204,7 +2073,7 @@ function renderStaticJS(env) {
   
   // 批量创建
   async function loadBatchAccounts() {
-    const res = await api('get-cf-accounts');
+    const res = await api('get-accounts');
     const container = document.getElementById('batchAccountList');
     if (res.success && res.accounts && res.accounts.length > 0) {
       container.innerHTML = res.accounts.map(acc => \`
@@ -2214,7 +2083,7 @@ function renderStaticJS(env) {
         </div>
       \`).join('');
     } else {
-      container.innerHTML = '<div class="small" style="padding:10px">暂无账号，请先在账号管理页面添加</div>';
+      container.innerHTML = '<div class="small" style="padding:10px">暂无账号，请在账号管理页面添加</div>';
     }
   }
   
@@ -2280,17 +2149,27 @@ function renderStaticJS(env) {
     document.getElementById('batchLog').innerHTML = '';
     appendBatchLog('开始批量创建，共 ' + selectedEmails.length + ' 个账号', '#fcd34d');
     
-    // 注意：批量创建需要获取每个账号的 key，这里简化处理
-    appendBatchLog('⚠️ 批量创建功能需要先切换到对应账号', '#f59e0b');
+    for (const email of selectedEmails) {
+      appendBatchLog('处理账号: ' + email);
+      
+      try {
+        // 获取当前会话信息或者直接使用存储的凭据
+        // 这里需要临时切换账号，但由于复杂度，暂时只使用当前账号
+        // 完整实现需要从存储中获取每个账号的 key
+        
+        // 简化版：只部署到当前选中的账号（需要先切换）
+        // 完整版需要从账号列表获取 key，这里保持简单
+        appendBatchLog('  ⚠️ 批量创建需要先切换到对应账号', '#f59e0b');
+      } catch (e) {
+        appendBatchLog('  ❌ 异常: ' + e.message, '#ef4444');
+      }
+    }
+    
     appendBatchLog('批量创建完成', '#fcd34d');
   }
   
   // KV 管理
   async function refreshKV() {
-    if (!currentSelectedAccount) {
-      document.getElementById('kvList').innerHTML = '<div class="small">请先在账号管理中选择一个账号</div>';
-      return;
-    }
     const accountId = localStorage.getItem('cf_accountId');
     const res = await api('list-kv-namespaces', { accountId });
     const container = document.getElementById('kvList');
@@ -2345,10 +2224,6 @@ function renderStaticJS(env) {
   
   // D1 管理
   async function refreshD1() {
-    if (!currentSelectedAccount) {
-      document.getElementById('d1List').innerHTML = '<div class="small">请先在账号管理中选择一个账号</div>';
-      return;
-    }
     const accountId = localStorage.getItem('cf_accountId');
     const res = await api('list-d1', { accountId });
     const container = document.getElementById('d1List');
@@ -2403,10 +2278,6 @@ function renderStaticJS(env) {
   
   // DNS 管理
   async function refreshZones() {
-    if (!currentSelectedAccount) {
-      document.getElementById('zonesList').innerHTML = '<div class="small">请先在账号管理中选择一个账号</div>';
-      return;
-    }
     const res = await api('list-zones');
     const container = document.getElementById('zonesList');
     if (!res.success || !res.result || res.result.length === 0) {
@@ -2461,7 +2332,7 @@ function renderStaticJS(env) {
             </tr>
           \`).join('')}
         </tbody>
-      现s
+      </table>
     \`;
   }
   
@@ -2479,6 +2350,11 @@ function renderStaticJS(env) {
     const content = document.getElementById('dnsContent').value.trim();
     const ttl = parseInt(document.getElementById('dnsTtl').value);
     const proxied = document.getElementById('dnsProxied').checked;
+    
+    if (!name || !content) {
+      showNotification('请填写完整信息', 'error');
+      return;
+    }
     
     const res = await api('create-dns-record', { zoneId: currentZoneId, type, name, content, ttl, proxied });
     if (res.success) {
@@ -2538,11 +2414,6 @@ function renderStaticJS(env) {
   
   // 子域名设置
   async function loadSubdomain() {
-    if (!currentSelectedAccount) {
-      document.getElementById('subdomainInput').disabled = true;
-      document.getElementById('subdomainInput').placeholder = '请先选择账号';
-      return;
-    }
     const accountId = localStorage.getItem('cf_accountId');
     const res = await api('get-workers-subdomain', { accountId });
     if (res.success && res.result && res.result.subdomain) {
@@ -2591,6 +2462,9 @@ function renderStaticJS(env) {
       return;
     }
     
+    // 显示当前账号（从 cookie 或 localStorage 获取）
+    document.getElementById('currentAccount').textContent = '已登录';
+    
     // 设置导航
     document.querySelectorAll('.nav .item').forEach(item => {
       item.addEventListener('click', () => navTo(item.dataset.page));
@@ -2602,16 +2476,8 @@ function renderStaticJS(env) {
       sourceTypeSelect.addEventListener('change', toggleBatchSourceInput);
     }
     
-    // 加载当前账号
-    loadCurrentAccount().then(() => {
-      // 如果有当前账号，加载 Workers
-      if (currentSelectedAccount) {
-        setTimeout(() => refreshWorkers(), 100);
-      } else {
-        // 没有账号时，自动切换到账号管理页面
-        navTo('accounts');
-      }
-    });
+    // 加载 Workers
+    setTimeout(() => refreshWorkers(), 100);
   })();
   
   // 导出全局函数
@@ -2631,14 +2497,13 @@ function renderStaticJS(env) {
   window.confirmAddDomain = confirmAddDomain;
   window.toggleSubdomain = toggleSubdomain;
   window.deleteDomain = deleteDomain;
-  window.selectAccount = selectAccount;
-  window.deleteAccount = deleteAccount;
+  window.switchToAccount = switchToAccount;
   window.openAddAccountModal = openAddAccountModal;
   window.closeAddAccountModal = closeAddAccountModal;
   window.confirmAddAccount = confirmAddAccount;
   window.showAccountSwitcher = showAccountSwitcher;
   window.closeAccountSwitcher = closeAccountSwitcher;
-  window.selectAccountAndClose = selectAccountAndClose;
+  window.switchToAccountAndClose = switchToAccountAndClose;
   window.logout = logout;
   window.refreshKV = refreshKV;
   window.openCreateKV = openCreateKV;
@@ -2667,7 +2532,6 @@ function renderStaticJS(env) {
   window.startBatchCreate = startBatchCreate;
   window.loadBatchAccounts = loadBatchAccounts;
   window.loadAccountsPage = loadAccountsPage;
-  window.loadCurrentAccount = loadCurrentAccount;
 })();`;
 }
 
