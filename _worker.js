@@ -208,66 +208,88 @@ async function handleAPI(req, env) {
   }
   
   // 登录
-  if (action === 'login') {
-    const { masterPassword } = payload;
-    
-    if (!masterPassword) {
-      return json({ success: false, error: '请输入访问密码' }, 400);
-    }
-    
-    const encryptedCredentials = await env.MY_KV.get('config:credentials');
-    if (!encryptedCredentials) {
-      return json({ success: false, error: '系统未配置，请先访问 /setup 进行配置' }, 400);
-    }
-    
-    try {
-      const accountsJson = await decrypt(encryptedCredentials, masterPassword);
-      const accounts = JSON.parse(accountsJson);
-      const defaultAccount = accounts.find(a => a.isDefault) || accounts[0];
-      
-      const sessionToken = generateSessionToken();
-      await env.MY_KV.put(`session:${sessionToken}`, JSON.stringify({
-        email: defaultAccount.email,
-        key: defaultAccount.key,
-        accounts: accounts,
-        expires: Date.now() + 8 * 3600000
-      }), { expirationTtl: 28800 });
-      
-      return json({ success: true, sessionToken, expiresIn: 28800 });
-      
-    } catch (error) {
-      return json({ success: false, error: '访问密码错误' }, 401);
-    }
+  // 登录 - 修改，存储完整账号列表到 session
+if (action === 'login') {
+  const { masterPassword } = payload;
+  
+  if (!masterPassword) {
+    return json({ success: false, error: '请输入访问密码' }, 400);
   }
   
-  // 获取账号列表
-  if (action === 'get-accounts') {
-    const sessionToken = payload.sessionToken;
-    if (!sessionToken) {
-      return json({ success: false, error: '未登录' }, 401);
-    }
-    
-    const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
-    if (!session || session.expires < Date.now()) {
-      return json({ success: false, error: '会话已过期' }, 401);
-    }
-    
-    return json({ success: true, accounts: session.accounts || [] });
+  const encryptedCredentials = await env.MY_KV.get('config:credentials');
+  if (!encryptedCredentials) {
+    return json({ success: false, error: '系统未配置，请先访问 /setup 进行配置' }, 400);
   }
+  
+  try {
+    const accountsJson = await decrypt(encryptedCredentials, masterPassword);
+    let accounts = JSON.parse(accountsJson);
+    
+    // 确保是数组格式
+    if (!Array.isArray(accounts)) {
+      accounts = [{ email: accounts.email, key: accounts.key, alias: '主账号', isDefault: true }];
+    }
+    
+    const defaultAccount = accounts.find(a => a.isDefault) || accounts[0];
+    
+    const sessionToken = generateSessionToken();
+    await env.MY_KV.put(`session:${sessionToken}`, JSON.stringify({
+      email: defaultAccount.email,
+      key: defaultAccount.key,
+      accounts: accounts,  // 存储完整账号列表
+      expires: Date.now() + 8 * 3600000
+    }), { expirationTtl: 28800 });
+    
+    return json({ success: true, sessionToken, expiresIn: 28800 });
+    
+  } catch (error) {
+    return json({ success: false, error: '访问密码错误' }, 401);
+  }
+}
+  // 获取账号列表 - 直接从 session 获取
+if (action === 'get-accounts') {
+  const sessionToken = payload.sessionToken;
+  if (!sessionToken) {
+    return json({ success: false, error: '未登录' }, 401);
+  }
+  
+  const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
+  if (!session || session.expires < Date.now()) {
+    return json({ success: false, error: '会话已过期' }, 401);
+  }
+  
+  // 从 session 中返回账号列表（登录时已经解密并存入了 session）
+  const accounts = session.accounts || [];
+  return json({ success: true, accounts: accounts.map(a => ({ 
+    email: a.email, 
+    alias: a.alias || a.email,
+    isDefault: a.isDefault 
+  })) });
+}
   
   // 添加账号
-  if (action === 'add-account') {
-    const { sessionToken, email, key, alias } = payload;
-    
-    if (!sessionToken) {
-      return json({ success: false, error: '未登录' }, 401);
-    }
-    
-    const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
-    if (!session || session.expires < Date.now()) {
-      return json({ success: false, error: '会话已过期' }, 401);
-    }
-    
+  // 添加账号 - 修复解密问题
+if (action === 'add-account') {
+  const { sessionToken, email, key, alias, masterPassword } = payload;
+  
+  if (!sessionToken) {
+    return json({ success: false, error: '未登录' }, 401);
+  }
+  
+  const session = await env.MY_KV.get(`session:${sessionToken}`, 'json');
+  if (!session || session.expires < Date.now()) {
+    return json({ success: false, error: '会话已过期' }, 401);
+  }
+  
+  if (!email || !key) {
+    return json({ success: false, error: '缺少邮箱或 API Key' }, 400);
+  }
+  
+  if (!masterPassword) {
+    return json({ success: false, error: '需要主密码才能添加账号' }, 400);
+  }
+  
+  try {
     // 验证新账号
     const testResult = await cfAny('GET', '/accounts', email, key);
     if (!testResult.success && !testResult.result) {
@@ -277,41 +299,51 @@ async function handleAPI(req, env) {
       });
     }
     
-    // 获取主密码（从加密存储中）
+    // 获取加密的凭据并解密
     const encryptedCredentials = await env.MY_KV.get('config:credentials');
-    const masterPassword = payload.masterPassword;
-    
-    if (!masterPassword) {
-      return json({ success: false, error: '需要主密码' }, 400);
+    if (!encryptedCredentials) {
+      return json({ success: false, error: '系统未配置' }, 400);
     }
     
+    let accounts;
     try {
       const accountsJson = await decrypt(encryptedCredentials, masterPassword);
-      let accounts = JSON.parse(accountsJson);
-      
-      // 检查是否已存在
-      const existingIndex = accounts.findIndex(a => a.email === email);
-      const newAccount = { email, key, alias: alias || email, isDefault: false };
-      
-      if (existingIndex >= 0) {
-        accounts[existingIndex] = newAccount;
-      } else {
-        accounts.push(newAccount);
-      }
-      
-      // 重新加密保存
-      const newEncrypted = await encrypt(JSON.stringify(accounts), masterPassword);
-      await env.MY_KV.put('config:credentials', newEncrypted);
-      
-      // 更新 session 中的账号列表
-      session.accounts = accounts;
-      await env.MY_KV.put(`session:${sessionToken}`, JSON.stringify(session), { expirationTtl: 28800 });
-      
-      return json({ success: true, message: '账号添加成功' });
-    } catch (error) {
-      return json({ success: false, error: '保存失败：' + error.message }, 500);
+      accounts = JSON.parse(accountsJson);
+    } catch (decryptError) {
+      console.error('Decrypt error:', decryptError);
+      return json({ success: false, error: '主密码错误，无法解密账号列表' }, 401);
     }
+    
+    // 确保 accounts 是数组
+    if (!Array.isArray(accounts)) {
+      accounts = [accounts];
+    }
+    
+    // 检查是否已存在
+    const existingIndex = accounts.findIndex(a => a.email === email);
+    const newAccount = { email, key, alias: alias || email, isDefault: false };
+    
+    if (existingIndex >= 0) {
+      accounts[existingIndex] = newAccount;
+    } else {
+      accounts.push(newAccount);
+    }
+    
+    // 重新加密保存
+    const newEncrypted = await encrypt(JSON.stringify(accounts), masterPassword);
+    await env.MY_KV.put('config:credentials', newEncrypted);
+    
+    // 更新 session 中的账号列表
+    session.accounts = accounts;
+    await env.MY_KV.put(`session:${sessionToken}`, JSON.stringify(session), { expirationTtl: 28800 });
+    
+    return json({ success: true, message: '账号添加成功' });
+    
+  } catch (error) {
+    console.error('Add account error:', error);
+    return json({ success: false, error: '添加失败：' + error.message }, 500);
   }
+}
   
   // 切换账号
   if (action === 'switch-account') {
