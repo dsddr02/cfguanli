@@ -6,5 +6,3 @@ compatibility_date = "2024-01-01"
 binding = "MY_KV"
 id = "5d2386b6975442aea7f50da0aac13e76"  # 替换为实际 ID
 
-[build]
-command = "echo 'Build complete'"
